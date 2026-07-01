@@ -1,0 +1,27 @@
+# ============================================================
+# Override Linux (serveur ou VM).
+#
+# Corrige le seul point qui casse sur Linux : l'écriture dans VoiceBox/data.
+# VoiceBox tourne en utilisateur non-root ; un bind-mount vide créé par Docker
+# appartient à root → PermissionError. Un volume nommé hérite des bonnes
+# permissions de l'image (le Dockerfile fait `chown voicebox /app/data`).
+#
+# Projects/, config/, Presets/, tools/QC restent en bind-mount : ils
+# fonctionnent (orchestrateur + QC tournent en root, ou lecture seule).
+#
+# Utilisation :
+#   Linux + GPU :
+#     docker compose -f docker-compose.yml -f docker-compose.linux.yml up -d --build
+#   Linux SANS GPU (ex. VM) — ajouter l'override CPU :
+#     docker compose -f docker-compose.yml -f docker-compose.linux.yml -f docker-compose.cpu.yml up -d --build
+# ============================================================
+
+services:
+  voicebox:
+    # !override remplace le bind-mount du fichier de base par un volume nommé
+    # (sinon Compose fusionne les deux mappings sur /app/data).
+    volumes: !override
+      - voicebox-data:/app/data
+
+volumes:
+  voicebox-data:
