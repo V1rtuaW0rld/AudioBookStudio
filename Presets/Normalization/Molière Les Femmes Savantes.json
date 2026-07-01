@@ -1,0 +1,84 @@
+{
+  "piece_style": "moliere",
+  "remove_page_numbers": true,
+  "normalization_rules": [
+    {
+      "id": "rule_0_didas",
+      "search": "/\\b(Philaminte|Henriette|Armande|Bélise|Trissotin|L'Épine|Chrysale|Clitandre|Ariste|Martine|Julien)\\s*(\\([^)]*\\))/g",
+      "replace": "\n\n$1\n\n$2",
+      "active": true
+    },
+    {
+      "id": "rule_0_dialogue",
+      "search": "/\\b(Philaminte|Henriette|Armande|Bélise|Trissotin|L'Épine|Chrysale|Clitandre|Ariste|Martine|Julien)\\s+([A-ZÀ-Ÿ])/g",
+      "replace": "\n\n$1\n\n$2",
+      "active": true
+    },
+    {
+      "id": "rule_1",
+      "search": "Molière : Oeuvres complètes",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_2",
+      "search": "Copyright Arvensa Editions",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_3",
+      "search": "/\\(\\s*Molière\\s*\\)/",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_4",
+      "search": "Comédies et Ballets",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_5",
+      "search": "/^\\s*LES FEMMES SAVANTES\\s*$/",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_6",
+      "search": "Table des matières",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_7",
+      "search": "Retour à la liste des titres",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_8",
+      "search": "/Page\\s+\\d+\\s*/",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_9",
+      "search": "/^(ACTE\\s+[IVX]+)$/i",
+      "replace": "\n$1",
+      "active": true
+    },
+    {
+      "id": "rule_10",
+      "search": "LES FEMMES SAVANTES",
+      "replace": "",
+      "active": true
+    },
+    {
+      "id": "rule_11",
+      "search": "/(ACTE\\s+[IVX]+.*$)/",
+      "replace": "\n\n$1",
+      "active": true
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+# ============================================================
+# Voicebox — Local TTS Server with Web UI (CPU)
+# Variante "web" pour la stack AudioBookStudio.
+# Identique au Dockerfile upstream, sauf le build frontend :
+# on retire le flag `--bun` qui casse le binaire natif d'esbuild.
+# ============================================================
+
+# === Stage 1: Build frontend ===
+FROM oven/bun:1 AS frontend
+
+WORKDIR /build
+
+# Copy workspace config and frontend source
+COPY package.json bun.lock CHANGELOG.md ./
+COPY app/ ./app/
+COPY web/ ./web/
+
+# Garde uniquement les workspaces nécessaires au build web (app + web).
+# Réécrit tout le tableau "workspaces" en une ligne propre, sans virgule
+# traînante (le sed upstream en laissait une, ce qui cassait esbuild).
+RUN sed -i -z 's/"workspaces": \[[^]]*\]/"workspaces": ["app", "web"]/' package.json
+RUN bun install --no-save
+# Build frontend (skip tsc — upstream has pre-existing type errors).
+# NB: pas de `--bun` ici, sinon esbuild plante (protocole binaire natif).
+RUN cd web && bunx vite build
+
+
+# === Stage 2: Build Python dependencies ===
+FROM python:3.11-slim AS backend-builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fenêtre de compatibilité pip étroite sur cet hôte (parsing de la ligne
+# --find-links de requirements.txt) :
+#   - pip 24.x : bug "Cannot mix str" / IndexError sur le parsing find-links
+#   - pip 26.x : segfault (exit 139)
+# pip 25.x parse correctement requirements.txt. La résolution des deps de
+# Qwen3-TTS (plus bas) est contournée via --no-deps.
+RUN python -m pip install --no-cache-dir "pip>=25,<26" "setuptools>=70" wheel
+
+# PYTHONPATH pointe sur le prefix : pip voit alors les paquets déjà installés
+# dans /install comme satisfaits lors des étapes suivantes.
+ENV PYTHONPATH=/install/lib/python3.11/site-packages
+
+COPY backend/requirements.txt .
+
+# Pré-installe les gros paquets ML d'abord. Cela allège fortement le graphe
+# de résolution de l'étape suivante et évite un crash natif intermittent
+# (SIGSEGV / exit 139) du résolveur pip sur la résolution complète.
+RUN pip install --no-cache-dir --prefix=/install \
+    "torch==2.12.1" "torchaudio==2.11.0" "numpy>=1.24.0,<2.0"
+
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install --no-deps chatterbox-tts
+RUN pip install --no-cache-dir --prefix=/install --no-deps hume-tada
+# --no-deps : évite le résolveur pip (qui plante sur le parsing d'index ici).
+# Les dépendances de Qwen3-TTS sont déjà couvertes par requirements.txt.
+RUN pip install --no-cache-dir --prefix=/install --no-deps \
+    git+https://github.com/QwenLM/Qwen3-TTS.git
+
+
+# === Stage 3: Runtime ===
+FROM python:3.11-slim
+
+# Create non-root user for security
+RUN groupadd -r voicebox && \
+    useradd -r -g voicebox -m -s /bin/bash voicebox
+
+WORKDIR /app
+
+# Install only runtime system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed Python packages from builder stage
+COPY --from=backend-builder /install /usr/local
+
+# Copy backend application code
+COPY --chown=voicebox:voicebox backend/ /app/backend/
+
+# Copy built frontend from frontend stage
+COPY --from=frontend --chown=voicebox:voicebox /build/web/dist /app/frontend/
+
+# Create data directories owned by non-root user
+RUN mkdir -p /app/data/generations /app/data/profiles /app/data/cache \
+    && chown -R voicebox:voicebox /app/data
+
+# Switch to non-root user
+USER voicebox
+
+# Expose the API port
+EXPOSE 17493
+
+# Health check — auto-restart if the server hangs
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+    CMD curl -f http://localhost:17493/health || exit 1
+
+# Start the FastAPI server
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "17493"]

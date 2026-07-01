@@ -1,0 +1,8 @@
+# Dépendances du microservice QC (Python 3.10)
+# Reprises de tools/QC/requirements.txt + serveur web.
+onnxruntime==1.17.1
+librosa==0.10.1
+numpy==1.26.4
+scikit-learn==1.4.1.post1
+fastapi
+uvicorn

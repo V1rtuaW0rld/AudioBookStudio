@@ -1,0 +1,7 @@
+{
+  "profile_id": "Narrator",
+  "language": "fr",
+  "engine": "qwen",
+  "model_size": "1.7B",
+  "effects_chain": []
+}

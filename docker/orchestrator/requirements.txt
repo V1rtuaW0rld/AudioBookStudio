@@ -1,0 +1,15 @@
+# Dépendances de l'orchestrateur + des tools de pipeline (Python 3.11).
+# Reprend la racine requirements.txt et ajoute le serveur web (non épinglé
+# dans la racine car il vivait dans le .venv Windows).
+beautifulsoup4==4.14.3
+EbookLib==0.20
+lxml==6.1.1
+six==1.17.0
+soupsieve==2.8.4
+typing_extensions==4.15.0
+pydub
+PyMuPDF
+fastapi
+uvicorn
+pydantic
+python-multipart

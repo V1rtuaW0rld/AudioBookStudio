@@ -1,0 +1,29 @@
+# Environnements Python (Windows) — reconstruits dans les images Linux
+.venv/
+tools/QC/venv/
+
+# Caches Python
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Données utilisateur (montées en volumes, pas dans l'image)
+Projects/
+Projects - Copy/
+Presets/
+config/
+
+# Frontend : dépendances et build (reconstruits dans l'image)
+webapp/frontend/node_modules/
+webapp/frontend/dist/
+
+# VoiceBox a son propre contexte de build (./VoiceBox) + .dockerignore
+VoiceBox/
+
+# Divers
+.git/
+archive/
+scratch/
+*.msi
+*.wav
+*.code-workspace

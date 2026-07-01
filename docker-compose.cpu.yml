@@ -1,0 +1,19 @@
+# ============================================================
+# Override CPU pour AudioBookStudio.
+#
+# Le compose de base active le GPU NVIDIA par défaut. Sur une machine SANS
+# GPU exploitable, cet override retire la réservation GPU :
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+#
+# Tout fonctionne alors en CPU (plus lent mais portable partout).
+# ============================================================
+
+services:
+  voicebox:
+    deploy:
+      resources:
+        # !override force le remplacement de la liste (sinon Compose fusionne
+        # et garde le GPU du fichier de base).
+        reservations:
+          devices: !override []

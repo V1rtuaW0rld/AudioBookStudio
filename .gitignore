@@ -1,0 +1,49 @@
+# ============================================================
+#  AudioBookStudio — .gitignore
+# ============================================================
+
+# --- Environnements Python (reconstruits dans les images Docker) ---
+.venv/
+tools/QC/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Données utilisateur (jamais versionnées) ---
+Projects/
+Projects - Copy/
+Projects - Copy*/
+
+# --- Données VoiceBox (voix, DB, modèles téléchargés ~Go) ---
+VoiceBox/data/
+
+# --- Dépendances JS / builds (reconstruits) ---
+node_modules/
+**/node_modules/
+webapp/frontend/dist/
+VoiceBox/web/dist/
+VoiceBox/target/
+VoiceBox/**/dist/
+
+# --- Sauvegarde du .git upstream de VoiceBox (vendorisation) ---
+VoiceBox/.git_upstream_bak/
+
+# --- Artefacts audio / binaires lourds ---
+*.wav
+*.mp3
+*.msi
+
+# --- Empreintes vocales de test (spécifiques à la machine) ---
+tools/QC/*.npy
+
+# --- Calibrage de vitesse TTS (spécifique à la machine) ---
+Presets/tts_speed.json
+
+# --- Config locale / secrets ---
+.claude/settings.local.json
+.env
+*.env
+
+# --- Divers / temporaire ---
+scratch/

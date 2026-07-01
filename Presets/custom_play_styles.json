@@ -1,0 +1,14 @@
+[
+  {
+    "id": "style_1782497030693",
+    "name": "Le Père Noël est une ordure - 'Personnage : '",
+    "pattern": "^\\s*__ACTORS__\\s*(?:\\(([^)]*)\\))?\\s*[:]\\s*(.*)$",
+    "system": false
+  },
+  {
+    "id": "style_1782585244857",
+    "name": "10 ans après - ACTEUR, et ;",
+    "pattern": "^\\s*__ACTORS__\\s*,?\\s*(?:\\(([^)]*)\\))?\\s*:\\s*(.*)$",
+    "system": false
+  }
+]

@@ -1,0 +1,1 @@
+Bonjour, ceci est un test de génération vocale en français avec le modèle Qwen TTS 1.7B sur la carte graphique RTX 4070 Ti SUPER.

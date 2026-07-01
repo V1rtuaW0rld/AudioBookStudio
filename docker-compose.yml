@@ -1,0 +1,100 @@
+# ============================================================
+# AudioBookStudio — stack complète
+#   docker compose up -d
+#
+#   frontend (nginx)  :5180  → exposé   (UI)
+#   orchestrator      :17490 → exposé   (API + audio)
+#   voicebox          :17493 → interne  (moteur TTS)
+#   qc                :8001  → interne  (contrôle qualité vocal)
+# ============================================================
+
+services:
+  voicebox:
+    build:
+      context: ./VoiceBox
+      dockerfile: Dockerfile.web
+    container_name: abs-voicebox
+    restart: unless-stopped
+    ports:
+      # Interface web VoiceBox (création/clonage des voix) + API.
+      - "17493:17493"
+    environment:
+      - LOG_LEVEL=info
+      - NUMBA_CACHE_DIR=/tmp/numba_cache
+      # Modèles TTS téléchargés sous data/models (bind-mount inscriptible),
+      # ce qui évite le souci de permission d'un volume nommé root-only.
+      - VOICEBOX_MODELS_DIR=/app/data/models
+      # GPU NVIDIA (ignoré si aucun GPU n'est réservé via le profil CPU).
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      # Données VoiceBox (DB + profils de voix + modèles), bind-mount relatif
+      # et portable. Les voix créées via l'UI atterrissent dans ./VoiceBox/data.
+      - ./VoiceBox/data:/app/data
+    networks:
+      - abs-net
+    # GPU NVIDIA activé PAR DÉFAUT (Windows ou Linux + nvidia-container-toolkit).
+    # Sur une machine SANS GPU, lancer avec l'override CPU :
+    #   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  qc:
+    build:
+      context: .
+      dockerfile: docker/qc/Dockerfile
+    container_name: abs-qc
+    restart: unless-stopped
+    environment:
+      - QC_MODEL_PATH=/app/tools/QC/voxceleb.onnx
+    volumes:
+      # Projects partagé avec l'orchestrateur (MÊME chemin interne /app/Projects)
+      - ./Projects:/app/Projects
+      # Modèle ONNX + scripts de référence
+      - ./tools/QC:/app/tools/QC
+    networks:
+      - abs-net
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/orchestrator/Dockerfile
+    container_name: abs-orchestrator
+    restart: unless-stopped
+    ports:
+      - "17490:17490"
+    environment:
+      # Cible TTS et service QC (noms de services Docker)
+      - VOICEBOX_URL=http://voicebox:17493
+      - QC_URL=http://qc:8001
+    volumes:
+      - ./Projects:/app/Projects
+      - ./Presets:/app/Presets
+      - ./config:/app/config
+    depends_on:
+      - voicebox
+      - qc
+    networks:
+      - abs-net
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    container_name: abs-frontend
+    restart: unless-stopped
+    ports:
+      - "5180:5180"
+    depends_on:
+      - orchestrator
+    networks:
+      - abs-net
+
+networks:
+  abs-net:
+    driver: bridge
