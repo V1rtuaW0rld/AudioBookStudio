@@ -10,5 +10,11 @@
     "name": "10 ans après - ACTEUR, et ;",
     "pattern": "^\\s*__ACTORS__\\s*,?\\s*(?:\\(([^)]*)\\))?\\s*:\\s*(.*)$",
     "system": false
+  },
+  {
+    "id": "style_1783256273296",
+    "name": "Perso en italique donc entrre parenthèses",
+    "pattern": "^(\\s*__ACTORS__\\s*(?:\\(([^)]*)\\))?\\s*[-–\\—]\\s*(.*)$)",
+    "system": false
   }
 ]

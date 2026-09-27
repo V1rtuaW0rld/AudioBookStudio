@@ -1,61 +1,82 @@
 import sys
 import re
 
-MIN_CHARS = 250
-MAX_CHARS = 400
+MIN_CHARS = 400
+MAX_CHARS = 500
 
-IDEAL_PUNCT = [";", ".", "!", "?"]
-ABBREVIATIONS = ["M.", "Mme.", "Dr.", "etc.", "Mlle.", "St.", "Ste."]
-CLOSING_QUOTES = ["»", "”", "\"", "’"]
+IDEAL_PUNCT = [".", "!", "?"]
+ABBREVIATIONS = ["M.", "MM.", "Mme.", "Mlle.", "Mr.", "Mrs.", "Ms.", "Dr.", "Pr.",
+                 "St.", "Ste.", "etc.", "cf.", "J.-C."]
+CLOSING_QUOTES = ["»", "”", "\"", "’", "'"]
 
 
 def is_abbreviation(text, pos):
     """Vérifie si la ponctuation est en fait une abréviation."""
     for abbr in ABBREVIATIONS:
-        if text[pos - len(abbr) + 1:pos + 1] == abbr:
+        if pos - len(abbr) + 1 >= 0 and text[pos - len(abbr) + 1:pos + 1] == abbr:
             return True
     return False
 
 
-def find_cut_position(text, min_size, max_size):
-    """Trouve la meilleure position de coupure dans text[min:max]."""
-    # Niveaux de priorité pour la coupure
-    PUNCT_PREFS = [
-        [";", ".", "!", "?"],  # Priorité 1 : Fin de phrase
-        [":"],                 # Priorité 2 : Deux-points
-        [","]                  # Priorité 3 : Virgule
-    ]
+def is_initial(text, pos):
+    """Vérifie si le point est une initiale isolée (ex: A., J.)."""
+    return bool(re.search(r'\b[A-Za-zÀ-ÿ]\.$', text[:pos + 1]))
 
-    for punct_list in PUNCT_PREFS:
-        best = -1
-        for p in punct_list:
-            pos = text.rfind(p, min_size, max_size)
-            if pos > best:
-                if is_abbreviation(text, pos):
-                    continue
 
-                # Vérifie guillemet fermant juste après
-                lookahead = text[pos + 1:pos + 4]
-                skip = 0
-                quote_offset = None
+def get_quote_offset(text, pos):
+    """Vérifie si un guillemet fermant suit la ponctuation (avec espace éventuel)."""
+    lookahead = text[pos + 1:pos + 5]
+    skip = 0
+    for ch in lookahead:
+        if ch in (" ", "\xa0"):
+            skip += 1
+            continue
+        if ch in CLOSING_QUOTES:
+            return skip + 1
+        break
+    return 0
 
-                for ch in lookahead:
-                    if ch == " ":
-                        skip += 1
-                        continue
-                    if ch in CLOSING_QUOTES:
-                        quote_offset = skip + 1
-                    break
 
-                if quote_offset is not None:
-                    return pos + quote_offset
+def find_best_punct_in_range(text, start, end):
+    """Cherche la dernière ponctuation stricte (. ! ?) valide dans text[start:end]."""
+    best = -1
+    for p in IDEAL_PUNCT:
+        pos = text.rfind(p, start, end)
+        while pos != -1:
+            if not is_abbreviation(text, pos) and not is_initial(text, pos):
+                offset = get_quote_offset(text, pos)
+                cut = pos + offset
+                if cut > best:
+                    best = cut
+                break
+            pos = text.rfind(p, start, pos)
+    return best
 
-                best = pos
 
-        if best != -1:
-            return best
+def find_cut_position(text, min_size=MIN_CHARS, max_size=MAX_CHARS):
+    """Trouve la meilleure position de coupure stricte (. ! ? uniquement)."""
+    # 1. Priorité 1 : Fin de phrase stricte dans la plage idéale [min_size, max_size]
+    cut = find_best_punct_in_range(text, min_size, max_size)
+    if cut > 0:
+        return cut
 
-    # Si aucune ponctuation valide → on coupe sur le dernier espace dans la plage pour ne pas couper un mot en deux
+    # 2. Si aucune fin de phrase dans [min_size, max_size] :
+    #    On cherche une fin de phrase un peu avant min_size (jusqu'à 200 car. plus tôt)
+    cut = find_best_punct_in_range(text, max(0, min_size - 200), min_size)
+    if cut > 0:
+        return cut
+
+    # 3. Si la phrase est longue et dépasse max_size : on cherche un peu après max_size (jusqu'à +150 car.)
+    cut = find_best_punct_in_range(text, max_size, min(len(text), max_size + 150))
+    if cut > 0:
+        return cut
+
+    # 4. Recherche élargie dès le début si nécessaire
+    cut = find_best_punct_in_range(text, 0, max(0, min_size - 200))
+    if cut > 0:
+        return cut
+
+    # 5. Dernier recours exceptionnel (phrase > 650 car. sans aucun . ! ?) : couper sur le dernier espace
     pos = text.rfind(" ", min_size, max_size)
     if pos != -1:
         return pos

@@ -1,0 +1,24 @@
+{
+  "piece_style": "none",
+  "remove_page_numbers": true,
+  "normalization_rules": [
+    {
+      "id": "rule_1783690634009",
+      "search": "\\*\\s*\\*\\s*\\*",
+      "replace": "\\n\\n",
+      "active": true
+    },
+    {
+      "id": "rule_1783690999758",
+      "search": "eux- mêmes",
+      "replace": "eux-mêmes",
+      "active": true
+    },
+    {
+      "id": "rule_1783691008915",
+      "search": "-\\s+",
+      "replace": "",
+      "active": true
+    }
+  ]
+}

@@ -1254,6 +1254,66 @@ input:checked + .slider .slider-knob {
   visibility: visible;
 }
 
+/* Quality Center : le panneau des voix s'élargit vers la DROITE, révélant les
+   colonnes de seuils. Les noms/dropdowns restent en place (pas de reflow). */
+.project-detail-layout {
+  transition: grid-template-columns 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.project-detail-layout.qc-mode {
+  grid-template-columns: 540px 1fr 380px;
+}
+/* Volet QC pleinement déployé : une seule colonne pleine largeur, jusqu'au
+   bord droit de l'écran. On masque les colonnes centrale (segments) et droite
+   (pipeline) — le panneau QC (config voix + tableau des anomalies) occupe tout. */
+.project-detail-layout.qc-mode.qc-expanded {
+  grid-template-columns: 1fr;
+}
+.project-detail-layout.qc-mode.qc-expanded > *:not(:first-child) {
+  display: none;
+}
+/* En mode déployé, la colonne ne scrolle PAS globalement : chaque sous-zone
+   (liste des rôles à gauche, tableau QC à droite) scrolle indépendamment,
+   comme les colonnes de la table centrale. */
+.project-detail-layout.qc-mode.qc-expanded > .side-column {
+  overflow: hidden;
+}
+
+/* Cellules de seuil : cases de grille (piste 34px), 2 chiffres suffisent. */
+.vmc-th-input {
+  width: 100%;
+  text-align: center;
+  padding: 4px 2px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  color: var(--text-main);
+  font-size: 12px;
+  -moz-appearance: textfield;
+}
+.vmc-th-input::-webkit-outer-spin-button,
+.vmc-th-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+/* En-tête : MÊME grille que la ligne du nom (display:grid inline). Le
+   padding-left compense bordure(1px)+padding(8px) de la carte → alignement. */
+.vmc-header {
+  margin-bottom: 10px;
+  padding-left: 9px;
+}
+.vmc-name-spacer {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.vmc-th-head {
+  width: 100%;
+  text-align: center;
+  font-size: 9.5px;
+  color: var(--text-muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 .normalizer-header {
   display: flex;
   align-items: center;
@@ -1365,4 +1425,57 @@ input:checked + .slider .slider-knob {
   background: rgba(0, 0, 0, 0.4);
   color: #a7f3d0;
   border-color: rgba(16, 185, 129, 0.15);
+}
+
+/* Éditeur avec coloration syntaxique (calque de fond + textarea transparent).
+   Le texte réel n'est PAS modifié : seule la ponctuation-clé est surlignée. */
+.hl-editor {
+  position: relative;
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+.hl-editor .hl-backdrop,
+.hl-editor .hl-input {
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+.hl-editor .hl-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  color: #f3f4f6;
+  overflow: auto;
+  pointer-events: none;
+  z-index: 0;
+}
+.hl-editor .hl-input {
+  position: relative;
+  flex: 1;
+  background: transparent;
+  color: transparent;
+  caret-color: #f3f4f6;
+  border-color: rgba(255, 255, 255, 0.08);
+  resize: none;
+  outline: none;
+  overflow: auto;
+  z-index: 1;
+}
+.hl-editor .hl-input:focus {
+  border-color: rgba(139, 92, 246, 0.5);
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.15);
+}
+.hl-editor .hl-mark {
+  color: #f87171;
+  font-weight: 700;
 }

@@ -6,3 +6,5 @@ numpy==1.26.4
 scikit-learn==1.4.1.post1
 fastapi
 uvicorn
+# Moteur d'empreinte vocale état-de-l'art (CAM++/ECAPA en ONNX, CPU, fbank intégré)
+sherpa-onnx

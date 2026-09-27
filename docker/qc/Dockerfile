@@ -16,6 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY docker/qc/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Modèle d'empreinte vocale ERes2Net (VoxCeleb) pour sherpa-onnx — CPU.
+# Choisi après comparaison empirique (CAM++/ResNet34/ERes2Net) : ERes2Net
+# sépare de loin le mieux les voix (voix différentes ~0.09 de similarité).
+RUN mkdir -p /app/models && \
+    curl -fL -o /app/models/speaker.onnx \
+    https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx
+
 COPY docker/qc/qc_server.py .
 
 EXPOSE 8001

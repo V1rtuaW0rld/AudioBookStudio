@@ -41,9 +41,14 @@ tools/QC/*.npy
 Presets/tts_speed.json
 
 # --- Config locale / secrets ---
-.claude/settings.local.json
+.claude/
 .env
 *.env
 
 # --- Divers / temporaire ---
 scratch/
+tools/AI/sortie*
+tools/AI/test*
+tools/AI/*.txt
+tools/AI - Copy/
+*.zip

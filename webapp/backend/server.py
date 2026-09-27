@@ -1,6 +1,9 @@
 import os
+import re
 import sys
 import json
+import shutil
+import signal
 import subprocess
 import asyncio
 import time
@@ -49,6 +52,12 @@ PRESETS_DIR = os.path.join(BASE_DIR, "Presets")
 NORMALIZATION_PRESETS_DIR = os.path.join(PRESETS_DIR, "Normalization")
 os.makedirs(NORMALIZATION_PRESETS_DIR, exist_ok=True)
 
+# Bibliothèque d'empreintes des voix VoiceBox (construite automatiquement,
+# partagée avec le service qc via le montage de Presets). Une empreinte .npy
+# par voix + un .meta.json (nom, durée de l'échantillon, sample_id).
+VOICEPRINTS_DIR = os.path.join(PRESETS_DIR, "voiceprints")
+os.makedirs(VOICEPRINTS_DIR, exist_ok=True)
+
 # Cache for segment JSON metadata to speed up get_project_details
 segment_cache = {}  # {project_name: {filename: {mtime: float, data: dict}}}
 
@@ -61,6 +70,19 @@ TTS_SPEED_FILE = os.path.join(PRESETS_DIR, "tts_speed.json")
 TTS_SPEED_DEFAULT_BASE_MS = 500.0   # latence de base estimée (modèle chaud)
 TTS_SPEED_DEFAULT_RATE_MS = 80.0    # ms/caractère par défaut tant qu'on n'a pas mesuré
 TTS_SPEED_ALPHA = 0.3               # poids de la dernière mesure dans l'EMA
+
+# --- Détection des générations TTS « emballées » (runaway) -------------------
+# VoiceBox part parfois en vrille et produit ~11 min de borborygmes au lieu d'un
+# court segment. On tue alors la tâche et on rejoue LE MÊME segment (sans purger
+# la queue). Nuance clé : au COLD START (modèle Qwen pas encore chargé), un petit
+# chunk peut légitimement tripler l'estimé → on laisse un plafond généreux ;
+# une fois le modèle CHAUD, 3× l'estimé = dérapage certain → on tue.
+RUNAWAY_FACTOR = 3.0            # seuil = 3 × temps estimé (modèle chaud)
+RUNAWAY_WARM_FLOOR_S = 25.0     # plancher chaud (bruit d'estimation sur petits chunks)
+RUNAWAY_COLD_MAX_S = 300.0      # plafond au démarrage (chargement modèle) : 5 min
+RUNAWAY_WARM_WINDOW_S = 600.0   # « chaud » = dernier succès il y a moins de 10 min
+RUNAWAY_MIN_SAMPLES = 3         # EMA jugée fiable au-delà de N mesures
+RUNAWAY_MAX_RETRIES = 2         # relances du segment après emballement
 
 
 def load_tts_speed() -> dict:
@@ -104,6 +126,17 @@ def update_tts_speed(engine: str, model_size: str, chars: int, duration_ms: floa
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[WARN] Could not save tts_speed: {e}")
+
+
+def estimate_gen_ms(chars: int) -> tuple:
+    """Temps de génération estimé (ms) pour `chars` caractères, + nb de mesures
+    de l'EMA (pour juger de sa fiabilité)."""
+    eng, msz = get_tts_engine_model()
+    entry = load_tts_speed().get(f"{eng}|{msz}", {})
+    base = entry.get("base_ms", TTS_SPEED_DEFAULT_BASE_MS)
+    rate = entry.get("ms_per_char", TTS_SPEED_DEFAULT_RATE_MS)
+    est = base + max(0, chars) * rate
+    return est, entry.get("samples", 0)
 
 
 # Mount the Projects folder to serve WAV/MP3 files directly
@@ -161,6 +194,9 @@ class NormalizeApplyRequest(BaseModel):
     piece_style: Union[Dict[str, Any], str]
     text: Optional[str] = None
     normalization_rules: Optional[List[NormalizationRule]] = None
+    # Roman : écrire le résultat DANS le txt source (pas de _formated), car le
+    # pipeline roman ne parse pas — il découpe directement le txt source.
+    overwrite_source: Optional[bool] = False
 
 
 class NormalizationPreset(BaseModel):
@@ -184,6 +220,9 @@ class QueueRequest(BaseModel):
     ranges: str
     voice: Optional[str] = None
     versions: Optional[int] = 1
+    qc_threshold: Optional[float] = None   # 0–100 ; None = mode normal (pas de boucle QC)
+    max_attempts: Optional[int] = 20
+    qc_batch: Optional[bool] = False       # True = résoudre le seuil par segment (meta.json)
 
 
 def parse_ranges(expr: str) -> List[int]:
@@ -255,117 +294,309 @@ def get_project_queue(name: str) -> ProjectQueue:
     return global_project_queue
 
 
-async def qc_compute_score(ref_npy: str, wav_path: str):
-    """Calcule le score de similarité vocale.
+def _normalize_voice_name(name: str) -> str:
+    """Normalise un nom de voix pour la résolution (casse, espaces, apostrophes)."""
+    if not name:
+        return ""
+    return name.strip().lower().replace("’", "'")
 
-    Retourne (score|None, log_text).
-    - Si QC_URL est défini : appel HTTP du microservice QC (Docker).
-    - Sinon : appel subprocess du venv QC local (comportement Windows).
+
+def resolve_voice_id(voice_name: str) -> Optional[str]:
+    """Résout un nom de voix (generated_voice) vers un voice_id de la bibliothèque.
+
+    Utilise l'index nom→id ; repli sur une comparaison normalisée (tolère les
+    différences de casse/espaces/encodage).
     """
-    if QC_URL:
-        loop = asyncio.get_event_loop()
-
-        def _do():
-            data = json.dumps({"ref_npy": ref_npy, "wav_path": wav_path}).encode("utf-8")
-            req = urllib.request.Request(
-                f"{QC_URL}/verify",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-
-        try:
-            result = await loop.run_in_executor(None, _do)
-            return result.get("score"), ""
-        except urllib.error.HTTPError as e:
-            return None, e.read().decode("utf-8", errors="ignore")
-        except Exception as e:
-            return None, str(e)
-
-    # --- Fallback subprocess (venv QC local) ---
-    qc_tool_dir = os.path.join(TOOLS_DIR, "QC")
-    qc_python = os.path.join(qc_tool_dir, "venv", "Scripts", "python.exe")
-    qc_script = os.path.join(qc_tool_dir, "verify_voice.py")
-
-    if not os.path.exists(qc_python) or not os.path.exists(qc_script):
-        return None, "Outil de vérification vocale (QC) non configuré ou venv manquant."
-
-    cmd = [qc_python, qc_script, ref_npy, wav_path]
+    if not voice_name:
+        return None
+    index_path = os.path.join(VOICEPRINTS_DIR, "index.json")
+    if not os.path.exists(index_path):
+        return None
     try:
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=qc_tool_dir, env=env
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+    except Exception:
+        return None
+    if voice_name in index:
+        return index[voice_name]
+    target = _normalize_voice_name(voice_name)
+    for name, vid in index.items():
+        if _normalize_voice_name(name) == target:
+            return vid
+    return None
+
+
+# --- Seuils QC centralisés PAR VOIX (et non par projet/rôle) ----------------
+# Le timbre calibré dépend de la voix VoiceBox, identique dans tous les
+# ouvrages. On stocke donc les seuils dans un fichier central indexé par
+# voice_id, réutilisé quel que soit le projet. L'UI reste par rôle : on
+# traduit rôle→voix via le voice_mapping du projet.
+CENTRAL_QC_THRESHOLDS_FILE = os.path.join(PRESETS_DIR, "qc_thresholds.json")
+
+# Série de seuils par défaut attribuée à toute voix sans réglage (existante ou
+# à venir). À affiner ensuite voix par voix ; évite la saisie à la chaîne.
+# Buckets ≤0.5/≤1/≤2/≤3/≤4/≤5/≤6/≤7/≤10 s ; >10s (clé "15") laissé libre.
+DEFAULT_QC_THRESHOLDS = {
+    "0.5": 19.0, "1": 25.0, "2": 33.0, "3": 43.0, "4": 47.0,
+    "5": 53.0, "6": 60.0, "7": 65.0, "10": 70.0,
+}
+
+
+def load_voice_thresholds() -> dict:
+    try:
+        with open(CENTRAL_QC_THRESHOLDS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_voice_thresholds(data: dict):
+    try:
+        os.makedirs(PRESETS_DIR, exist_ok=True)
+        with open(CENTRAL_QC_THRESHOLDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] save_voice_thresholds: {e}")
+
+
+def _project_voice_mapping(project_name: str) -> dict:
+    meta_path = os.path.join(PROJECTS_DIR, project_name, "meta.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f).get("voice_mapping", {}) or {}
+    except Exception:
+        return {}
+
+
+def resolve_segment_voice_name(project_name: str, seg_data: dict) -> Optional[str]:
+    """Nom de la VRAIE voix d'un segment pour le QC :
+    1) `generated_voice` (voix réellement utilisée pour le WAV) si présent ;
+    2) sinon voix mappée du rôle (`voice_mapping[profile_id]`) ;
+    3) sinon voix du narrateur (NARRATEUR/Narrator).
+    On ne renvoie JAMAIS un nom de rôle comme voix (ex. 'MARCEL')."""
+    gv = seg_data.get("generated_voice")
+    if gv:
+        return gv
+    pid = (seg_data.get("profile_id") or "").strip()
+    mapping = _project_voice_mapping(project_name)
+    narrator = mapping.get("NARRATEUR") or mapping.get("Narrator")
+    mapped = mapping.get(pid)
+    if pid and pid not in ("Narrator", "NARRATEUR", "DIDAS") and mapped and mapped != "DIDAS":
+        return mapped
+    return narrator
+
+
+def build_role_thresholds(voice_mapping: dict) -> dict:
+    """Construit la table par rôle à partir des seuils centraux par voix
+    (pour l'affichage : chaque rôle → seuils de sa voix assignée)."""
+    central = load_voice_thresholds()
+    out = {}
+    for role, voice_name in (voice_mapping or {}).items():
+        vid = resolve_voice_id(voice_name)
+        if vid and vid in central:
+            out[role] = central[vid]
+    return out
+
+
+def build_voices_used(segments) -> dict:
+    """Voix réellement utilisées (generated_voice) dans le projet + leurs seuils
+    centraux, pour l'édition PAR VOIX dans QC (romans mono/multi-voix).
+    Retour : { voice_name: {voice_id, thresholds} }."""
+    central = load_voice_thresholds()
+    out = {}
+    for seg in segments:
+        vn = seg.get("generated_voice")
+        if not vn or vn in out:
+            continue
+        vid = resolve_voice_id(vn)
+        out[vn] = {"voice_id": vid, "thresholds": (central.get(vid, {}) if vid else {})}
+    return out
+
+
+def migrate_qc_thresholds_to_central():
+    """Migration unique : recopie les seuils par rôle des meta.json de projets
+    vers le store central par voix (sans écraser une voix déjà présente)."""
+    central = load_voice_thresholds()
+    changed = False
+    if not os.path.isdir(PROJECTS_DIR):
+        return
+    for proj in os.listdir(PROJECTS_DIR):
+        meta_path = os.path.join(PROJECTS_DIR, proj, "meta.json")
+        if not os.path.exists(meta_path):
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+        thr = meta.get("qc_thresholds") or {}
+        mapping = meta.get("voice_mapping") or {}
+        for role, buckets in thr.items():
+            voice_name = mapping.get(role)
+            if not voice_name:
+                continue
+            vid = resolve_voice_id(voice_name)
+            if vid and vid not in central and buckets:
+                central[vid] = buckets
+                changed = True
+                print(f"[MIGRATION] Seuils QC '{proj}'/{role} → voix {vid}")
+    if changed:
+        save_voice_thresholds(central)
+
+
+def ensure_default_voice_thresholds():
+    """Attribue la série par défaut à toute voix connue (index des empreintes)
+    qui n'a aucun seuil dans le store central. Idempotent : ne touche pas aux
+    voix déjà calibrées. Appelé au démarrage et après chaque sync d'empreintes."""
+    index_path = os.path.join(VOICEPRINTS_DIR, "index.json")
+    if not os.path.exists(index_path):
+        return
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+    except Exception:
+        return
+    central = load_voice_thresholds()
+    changed = False
+    for _name, vid in index.items():
+        if not vid:
+            continue
+        entry = central.get(vid) or {}
+        # Remplit chaque bucket MANQUANT avec sa valeur par défaut, sans écraser
+        # les buckets déjà calibrés → les nouveaux calibres (0.5/4/6 s) arrivent
+        # aussi sur les voix existantes.
+        for bucket, val in DEFAULT_QC_THRESHOLDS.items():
+            if bucket not in entry:
+                entry[bucket] = val
+                changed = True
+        central[vid] = entry
+    if changed:
+        save_voice_thresholds(central)
+        print(f"[QC] Calibres par défaut complétés pour les voix (buckets manquants).")
+
+
+def _duration_bucket(d: float) -> str:
+    """Mapping durée→bucket, identique au frontend (QC_BUCKETS)."""
+    if d <= 0.5: return "0.5"
+    if d <= 1:  return "1"
+    if d <= 2:  return "2"
+    if d <= 3:  return "3"
+    if d <= 4:  return "4"
+    if d <= 5:  return "5"
+    if d <= 6:  return "6"
+    if d <= 7:  return "7"
+    if d <= 10: return "10"
+    return "15"
+
+
+def resolve_qc_threshold_for_segment(project_name: str, num: int) -> Optional[float]:
+    """Résout le seuil QC d'un segment depuis le store central PAR VOIX
+    (Presets/qc_thresholds.json[voice_id][bucket-durée]).
+
+    La voix est celle réellement utilisée (generated_voice), sinon la voix
+    assignée au rôle. Retourne None si aucun seuil configuré (→ génération
+    simple) ou si la durée est inconnue.
+    """
+    project_dir = os.path.join(PROJECTS_DIR, project_name)
+    json_path = os.path.join(project_dir, "tts", f"seg{str(num).zfill(5)}.json")
+    if not os.path.exists(json_path):
+        return None
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            seg_data = json.load(f)
+    except Exception:
+        return None
+    profile_id = (seg_data.get("profile_id") or "").replace("’", "'")
+    duration = seg_data.get("qc_duration")
+    if duration is None:
+        wav_path = os.path.join(project_dir, "audio", f"seg{str(num).zfill(5)}.wav")
+        if os.path.exists(wav_path):
+            duration = get_wav_duration(wav_path)
+    if duration is None:
+        return None
+    # Voix réelle → voice_id. Repli sur la voix assignée au rôle.
+    voice_name = seg_data.get("generated_voice") or _project_voice_mapping(project_name).get(profile_id)
+    voice_id = resolve_voice_id(voice_name)
+    if not voice_id:
+        return None
+    central = load_voice_thresholds()
+    val = (central.get(voice_id, {}) or {}).get(_duration_bucket(float(duration)))
+    if val in (None, ""):
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+async def qc_score_native(voice_id: str, wav_path: str):
+    """Note un chunk contre l'empreinte multi-durées d'une voix (service QC HTTP).
+
+    Retourne (result_dict|None, error_text). result_dict = {score, duration, ...}
+    où score peut être None (chunk trop court → n/a).
+    """
+    if not QC_URL:
+        return None, "Service QC indisponible (QC_URL non défini)."
+    loop = asyncio.get_event_loop()
+
+    def _do():
+        data = json.dumps({"voice_id": voice_id, "wav_path": wav_path}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{QC_URL}/score",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        stdout_data, _ = await process.communicate()
-        output_text = stdout_data.decode("utf-8", errors="ignore")
-        score = None
-        for line in output_text.splitlines():
-            if "Score de similarite :" in line:
-                try:
-                    score = float(line.split("Score de similarite :")[-1].strip())
-                except ValueError:
-                    pass
-        return score, output_text
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        return await loop.run_in_executor(None, _do), ""
+    except urllib.error.HTTPError as e:
+        return None, e.read().decode("utf-8", errors="ignore")
     except Exception as e:
         return None, str(e)
 
 
-async def qc_create_voiceprint(wav_path: str, dest_npy: str):
-    """Crée une empreinte de référence (.npy).
-
-    Retourne (ok: bool, log_text).
-    - Si QC_URL est défini : appel HTTP du microservice QC (Docker).
-    - Sinon : appel subprocess du venv QC local (comportement Windows).
-    """
-    if QC_URL:
-        loop = asyncio.get_event_loop()
-
-        def _do():
-            data = json.dumps({"wav_path": wav_path, "output_npy": dest_npy}).encode("utf-8")
-            req = urllib.request.Request(
-                f"{QC_URL}/voiceprint",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-
-        try:
-            result = await loop.run_in_executor(None, _do)
-            return os.path.exists(dest_npy), result.get("message", "")
-        except urllib.error.HTTPError as e:
-            return False, e.read().decode("utf-8", errors="ignore")
-        except Exception as e:
-            return False, str(e)
-
-    # --- Fallback subprocess (venv QC local) ---
-    qc_tool_dir = os.path.join(TOOLS_DIR, "QC")
-    qc_python = os.path.join(qc_tool_dir, "venv", "Scripts", "python.exe")
-    qc_script = os.path.join(qc_tool_dir, "create_voiceprint.py")
-
-    if not os.path.exists(qc_python):
-        return False, "Environnement virtuel de QC introuvable (venv/Scripts/python.exe dans tools/QC/)"
-    if not os.path.exists(qc_script):
-        return False, "Script create_voiceprint.py introuvable dans tools/QC/"
-
-    cmd = [qc_python, qc_script, wav_path, dest_npy]
+def set_segment_read(project_name: str, num: int, value: int):
+    """Écrit le drapeau `read` (0 = audio non écouté, 1 = écouté/validé) dans le
+    JSON du segment. Persistant côté serveur → partagé entre navigateurs
+    (remplace le suivi par cache navigateur, non fiable)."""
+    json_path = os.path.join(PROJECTS_DIR, project_name, "tts", f"seg{str(num).zfill(5)}.json")
+    if not os.path.exists(json_path):
+        return
     try:
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=qc_tool_dir, env=env
-        )
-        stdout_data, _ = await process.communicate()
-        output_text = stdout_data.decode("utf-8", errors="ignore")
-        if process.returncode != 0:
-            return False, f"Le script s'est terminé avec le code {process.returncode}. Log:\n{output_text}"
-        return os.path.exists(dest_npy), output_text
+        with open(json_path, "r", encoding="utf-8") as f:
+            seg_data = json.load(f)
+        seg_data["read"] = int(value)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(seg_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        return False, str(e)
+        print(f"[WARN] set_segment_read seg {num}: {e}")
+
+
+def set_segment_qc_status(project_name: str, num: int, status: Optional[str]):
+    """Écrit le statut QC manuel dans le JSON du segment.
+
+    - 'forced'   : override manuel (clic droit) → ignoré par le tableau QC
+                   même si la note n'est pas atteinte.
+    - 'accepted' : validé (passé le seuil et approuvé) → ignoré aussi.
+    - None/'clear': retire le statut (le segment repasse dans la logique normale).
+    """
+    json_path = os.path.join(PROJECTS_DIR, project_name, "tts", f"seg{str(num).zfill(5)}.json")
+    if not os.path.exists(json_path):
+        return
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            seg_data = json.load(f)
+        if status in (None, "", "clear"):
+            seg_data.pop("qc_status", None)
+        else:
+            seg_data["qc_status"] = status
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(seg_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] set_segment_qc_status seg {num}: {e}")
 
 
 async def run_auto_evaluation(project_name: str, num: int, pq: Optional[ProjectQueue] = None):
@@ -378,29 +609,24 @@ async def run_auto_evaluation(project_name: str, num: int, pq: Optional[ProjectQ
     if not os.path.exists(json_path):
         return
 
-    # Resolve project type
-    meta_path = os.path.join(project_dir, "meta.json")
-    project_type = "novel"
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta_data = json.load(f)
-            project_type = meta_data.get("type", "novel")
-        except Exception:
-            pass
-
     try:
         with open(json_path, "r", encoding="utf-8") as f:
             seg_data = json.load(f)
-        actor = "Narrator" if project_type in ["novel", "novel_multi"] else seg_data.get("profile_id", "Narrator")
     except Exception:
         return
 
-    # Check if reference exists
-    qc_dir = os.path.join(project_dir, "QC")
-    ref_npy = os.path.join(qc_dir, f"ref_{actor.strip()}.npy")
-    if not os.path.exists(ref_npy):
+    # La voix réellement utilisée pour produire le WAV (jamais un nom de rôle).
+    voice_name = resolve_segment_voice_name(project_name, seg_data)
+    had_print = resolve_voice_id(voice_name) is not None
+    # Empreinte manquante → on tente de la fabriquer une fois depuis VoiceBox.
+    voice_id = ensure_voiceprint_for_name(voice_name)
+    if not voice_id:
+        # Vraiment aucune empreinte possible : rien à noter (jamais de faux rouge).
+        if pq:
+            pq.emit_log(f"[INFO] QC : pas d'empreinte pour la voix '{voice_name}' (échantillon VoiceBox manquant ?), segment {num} non noté.")
         return
+    if not had_print and pq:
+        pq.emit_log(f"[INFO] QC : empreinte créée automatiquement pour la voix '{voice_name}'.")
 
     wav_name = f"seg{str(num).zfill(5)}.wav"
     wav_path = os.path.join(project_dir, "audio", wav_name)
@@ -408,13 +634,22 @@ async def run_auto_evaluation(project_name: str, num: int, pq: Optional[ProjectQ
         return
 
     try:
-        score, log_text = await qc_compute_score(ref_npy, wav_path)
-        if score is not None:
-            seg_data["qc_score"] = score
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(seg_data, f, ensure_ascii=False, indent=2)
+        result, err = await qc_score_native(voice_id, wav_path)
+        if result is None:
             if pq:
-                pq.emit_log(f"[INFO] Evaluation QC automatique : similarite de {score*100:.0f}% detectee.")
+                pq.emit_log(f"[WARN] Echec de l'evaluation QC automatique : {err}")
+            return
+        # score peut être None (chunk trop court → n/a) : on l'écrit tel quel.
+        seg_data["qc_score"] = result.get("score")
+        seg_data["qc_duration"] = result.get("duration")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(seg_data, f, ensure_ascii=False, indent=2)
+        if pq:
+            sc = result.get("score")
+            if sc is None:
+                pq.emit_log(f"[INFO] QC segment {num} : n/a (chunk trop court, {result.get('duration', 0):.1f}s).")
+            else:
+                pq.emit_log(f"[INFO] QC segment {num} : similarite {sc*100:.0f}% (réf {result.get('matched_ref_sec')}s).")
     except Exception as e:
         if pq:
             pq.emit_log(f"[WARN] Echec de l'evaluation QC automatique : {str(e)}")
@@ -422,13 +657,32 @@ async def run_auto_evaluation(project_name: str, num: int, pq: Optional[ProjectQ
 
 class GlobalTTSQueue:
     def __init__(self):
-        self.pending_tasks: List[Dict] = []  # List of {"project_name": str, "num": int, "voice": str, "versions": int, "project_type": str}
+        self.pending_tasks: List[Dict] = []
         self.active_task: Optional[Dict] = None
         self.worker_task: Optional[asyncio.Task] = None
         self.active_process = None
         self.aborted = False
+        self.last_gen_success: Optional[float] = None  # time.monotonic() du dernier succès (chaleur modèle)
 
-    def add_segments(self, project_name: str, segment_nums: List[int], voice: Optional[str], project_type: str, versions: int = 1):
+    def _kill_active_group(self):
+        """Tue DUREMENT le groupe de process de la génération en cours
+        (generate_audio.py + speak_text.py) → ferme la socket VoiceBox. Distinct
+        du stop « doux » qui laisse finir le TTS en cours."""
+        p = self.active_process
+        if not p:
+            return
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def add_segments(self, project_name: str, segment_nums: List[int], voice: Optional[str],
+                     project_type: str, versions: int = 1,
+                     qc_threshold: Optional[float] = None, max_attempts: int = 20,
+                     qc_batch: bool = False):
         self.aborted = False
         pq = get_project_queue(project_name)
         if not self.active_task and not self.pending_tasks:
@@ -444,38 +698,134 @@ class GlobalTTSQueue:
                 "num": num,
                 "voice": voice,
                 "versions": versions,
-                "project_type": project_type
+                "project_type": project_type,
+                "qc_threshold": qc_threshold,
+                "max_attempts": max_attempts,
+                "qc_batch": qc_batch,
             })
             added.append(num)
 
         if added:
-            pq.emit_log(f"[INFO] File d'attente globale : ajout des segments {added} pour le projet '{project_name}' (voix: {voice or 'défaut'}, versions: {versions})")
+            qc_info = f", seuil QC: {qc_threshold:.0f}%" if qc_threshold is not None else ""
+            pq.emit_log(f"[INFO] File d'attente : ajout segments {added} projet '{project_name}' (voix: {voice or 'défaut'}, versions: {versions}{qc_info})")
 
         if not self.worker_task or self.worker_task.done():
             self.worker_task = asyncio.create_task(self.run_worker())
+
+    def _runaway_timeout_s(self, seg_chars: int) -> tuple:
+        """Délai au-delà duquel une génération est jugée « emballée ».
+        - modèle CHAUD (dernier succès récent + EMA fiable) : 3 × estimé (plancher).
+        - sinon (cold start / EMA jeune) : plafond généreux de chargement."""
+        est_ms, samples = estimate_gen_ms(seg_chars)
+        now = time.monotonic()
+        warm = (self.last_gen_success is not None
+                and (now - self.last_gen_success) < RUNAWAY_WARM_WINDOW_S
+                and samples >= RUNAWAY_MIN_SAMPLES)
+        if warm:
+            return max(RUNAWAY_WARM_FLOOR_S, RUNAWAY_FACTOR * est_ms / 1000.0), True
+        return RUNAWAY_COLD_MAX_S, False
+
+    async def _exec_one_generation(self, cmd: list, pq, env: dict, seg_chars: int, out_wav: Optional[str] = None) -> str:
+        """Lance une génération, stream les logs, met à jour l'EMA vitesse.
+        Renvoie 'ok' | 'fail' | 'runaway'. Sur runaway (dépassement du seuil),
+        tue DUREMENT le groupe de process (→ arrête VoiceBox) et renvoie 'runaway'."""
+        gen_start = time.monotonic()
+        timeout_s, warm = self._runaway_timeout_s(seg_chars)
+        try:
+            self.active_process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=BASE_DIR, env=env, start_new_session=True,
+            )
+
+            async def _pump():
+                while True:
+                    line = await self.active_process.stdout.readline()
+                    if not line:
+                        break
+                    pq.emit_log(line.decode('utf-8', errors='ignore').rstrip('\r\n'))
+
+            pump_task = asyncio.create_task(_pump())
+            try:
+                await asyncio.wait_for(self.active_process.wait(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                self._kill_active_group()
+                pump_task.cancel()
+                mode = "3× l'estimé, modèle chaud" if warm else "plafond de démarrage"
+                pq.emit_log(f"[WARN] Génération emballée : dépassé {timeout_s:.0f}s ({mode}). "
+                            f"Tâche VoiceBox tuée.")
+                # WAV partiel/tronqué laissé par le kill → on le supprime pour ne
+                # jamais conserver un audio incomplet.
+                if out_wav and os.path.exists(out_wav):
+                    try:
+                        os.remove(out_wav)
+                    except Exception:
+                        pass
+                return "runaway"
+
+            await pump_task
+            rc = self.active_process.returncode
+            if rc == 0:
+                if seg_chars > 0:
+                    eng, msz = get_tts_engine_model()
+                    update_tts_speed(eng, msz, seg_chars, (time.monotonic() - gen_start) * 1000.0)
+                self.last_gen_success = time.monotonic()
+                return "ok"
+            return "fail"
+        except Exception as e:
+            if not self.aborted:
+                pq.emit_log(f"[ERREUR] Impossible de lancer la génération : {str(e)}")
+            return "fail"
+        finally:
+            self.active_process = None
+
+    async def _run_generation_watchdog(self, cmd: list, pq, env: dict, seg_chars: int, out_wav: Optional[str] = None) -> bool:
+        """Génère avec surveillance d'emballement : relance LE MÊME segment
+        jusqu'à RUNAWAY_MAX_RETRIES fois si VoiceBox dérape. Renvoie True si succès.
+        Ne purge PAS la queue : au retour, le worker enchaîne normalement."""
+        attempts = RUNAWAY_MAX_RETRIES + 1
+        for i in range(attempts):
+            if self.aborted:
+                return False
+            status = await self._exec_one_generation(cmd, pq, env, seg_chars, out_wav)
+            if status == "runaway" and not self.aborted and i < attempts - 1:
+                pq.emit_log(f"[INFO] Relance du segment (tentative {i + 2}/{attempts}) après emballement.")
+                continue
+            if status == "runaway" and not self.aborted:
+                pq.emit_log(f"[ERREUR] Emballement persistant après {attempts} tentatives — segment laissé sans audio fiable.")
+            return status == "ok"
+        return False
 
     async def run_worker(self):
         while self.pending_tasks:
             task = self.pending_tasks.pop(0)
             self.active_task = task
-            
-            project_name = task["project_name"]
-            num = task["num"]
-            voice = task["voice"]
-            versions = task["versions"]
-            project_type = task["project_type"]
-            
+
+            project_name  = task["project_name"]
+            num           = task["num"]
+            voice         = task["voice"]
+            versions      = task["versions"]
+            project_type  = task["project_type"]
+            qc_threshold  = task.get("qc_threshold")   # float 0-100, ou None
+            max_attempts  = task.get("max_attempts", 20)
+
+            # Batch QC : résoudre le seuil segment par segment depuis meta.json
+            # (perso × bucket de durée). None → génération simple (comme le
+            # bouton « régénérer » sur un segment sans seuil configuré).
+            if task.get("qc_batch") and qc_threshold is None:
+                qc_threshold = resolve_qc_threshold_for_segment(project_name, num)
+
             pq = get_project_queue(project_name)
             pq.active_segment = num
-            
+
             project_dir = os.path.join(PROJECTS_DIR, project_name)
-            audio_dir = os.path.join(project_dir, "audio")
+            audio_dir   = os.path.join(project_dir, "audio")
             os.makedirs(audio_dir, exist_ok=True)
 
-            # Clear existing qc_score from segment JSON since we are about to regenerate the audio
-            tts_dir = os.path.join(project_dir, "tts")
+            tts_dir   = os.path.join(project_dir, "tts")
             json_name = f"seg{str(num).zfill(5)}.json"
             json_path = os.path.join(tts_dir, json_name)
+
+            # Efface le score QC du run précédent
             if os.path.exists(json_path):
                 try:
                     with open(json_path, "r", encoding="utf-8") as f:
@@ -485,9 +835,9 @@ class GlobalTTSQueue:
                         with open(json_path, "w", encoding="utf-8") as f:
                             json.dump(seg_data, f, ensure_ascii=False, indent=2)
                 except Exception as e:
-                    print(f"Warning: Failed to clear qc_score before generation: {e}")
+                    print(f"Warning: Failed to clear qc_score: {e}")
 
-            # Nombre de caractères du segment (pour le calibrage de vitesse).
+            # Longueur texte pour calibrage vitesse TTS
             seg_chars = 0
             try:
                 if os.path.exists(json_path):
@@ -501,58 +851,209 @@ class GlobalTTSQueue:
             except Exception:
                 seg_chars = 0
 
-            runs = range(1, versions + 1) if versions > 1 else [0]
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
 
-            for run_idx in runs:
-                if project_type == "theatre":
-                    script_path = os.path.join(TOOLS_DIR, "generate_audio_theatre.py")
-                    cmd = [PYTHON_EXE, script_path, project_name, str(num)]
-                    if voice:
-                        cmd.append(voice)
-                else:
-                    script_path = os.path.join(TOOLS_DIR, "generate_audio.py")
-                    cmd = [PYTHON_EXE, script_path, project_name, str(num), voice or "Narrator"]
-
-                run_desc = f"version {run_idx}" if versions > 1 else "unique"
-                pq.emit_log(f"[INFO] Traitement du segment {num} ({run_desc}) pour le projet '{project_name}' ...")
-                pq.emit_log(f"[INFO] Commande : {' '.join(cmd)}")
-
+            # Commande de génération (identique pour tous les runs)
+            if project_type == "theatre":
+                script_path = os.path.join(TOOLS_DIR, "generate_audio_theatre.py")
+                cmd = [PYTHON_EXE, script_path, project_name, str(num)]
+                if voice:
+                    cmd.append(voice)
+            else:
+                # Roman : résolution rôle + voix PAR SEGMENT.
+                # - chunk assigné à un personnage (custom_characters) → voix mappée
+                #   (roman multi-voix : ex. EVA → Julia Roberts) ;
+                # - sinon → narrateur (voix de la tâche). Rétro-compatible.
+                seg_role = "Narrator"
+                seg_voice = "Narrator"
                 try:
-                    env = os.environ.copy()
-                    env["PYTHONUNBUFFERED"] = "1"
-                    gen_start = time.monotonic()
-                    self.active_process = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        cwd=BASE_DIR,
-                        env=env
-                    )
+                    meta_p = os.path.join(project_dir, "meta.json")
+                    with open(meta_p, "r", encoding="utf-8") as f:
+                        _meta = json.load(f)
+                    _mapping = _meta.get("voice_mapping", {}) or {}
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        _pid = (json.load(f).get("profile_id") or "").strip()
+                    # Voix du narrateur (repli) : jamais un nom de rôle, toujours une
+                    # vraie voix mappée -> indispensable pour que le QC retrouve
+                    # l'empreinte et note le segment.
+                    narrator_voice = (_mapping.get("NARRATEUR") or _mapping.get("Narrator")
+                                      or voice or "Narrator")
+                    # LE MAPPING FAIT FOI : si le rôle a une voix mappée (≠ DIDAS),
+                    # on l'utilise — sans exiger sa présence dans custom_characters
+                    # (les rôles détectés/non persistés étaient à tort renvoyés au
+                    # narrateur, ex. « PAYSAN CRI »).
+                    _mapped = _mapping.get(_pid)
+                    if (_pid and _pid not in ("Narrator", "NARRATEUR", "DIDAS")
+                            and _mapped and _mapped != "DIDAS"):
+                        seg_role = _pid
+                        seg_voice = _mapped
+                    else:
+                        seg_role = _pid or "Narrator"
+                        seg_voice = narrator_voice
+                except Exception:
+                    pass
+                script_path = os.path.join(TOOLS_DIR, "generate_audio.py")
+                cmd = [PYTHON_EXE, script_path, project_name, str(num), seg_role, seg_voice]
 
-                    while True:
-                        line = await self.active_process.stdout.readline()
-                        if not line:
+            main_wav = os.path.join(audio_dir, f"seg{str(num).zfill(5)}.wav")
+
+            if qc_threshold is not None and QC_URL:
+                # ── MODE QC : boucle génération → score → vérification ──────
+                voice_id_cache = [None]   # liste pour mutabilité dans closure sync
+
+                def get_voice_id():
+                    if voice_id_cache[0] is not None:
+                        return voice_id_cache[0]
+                    try:
+                        with open(json_path, "r", encoding="utf-8") as f:
+                            sd = json.load(f)
+                        vn  = sd.get("generated_voice") or sd.get("profile_id")
+                        # Empreinte créée à la volée si absente (nouvelle voix VoiceBox).
+                        vid = ensure_voiceprint_for_name(vn)
+                        if vid:
+                            voice_id_cache[0] = vid
+                        return vid
+                    except Exception:
+                        return None
+
+                if versions == 1:
+                    # Unitaire : rejouer jusqu'au seuil ou max_attempts.
+                    # On conserve TOUJOURS la meilleure tentative en repli (jamais
+                    # de segment sans audio, même si le seuil n'est pas atteint).
+                    attempt   = 0
+                    passed    = False
+                    best_pct  = None
+                    best_tmp  = os.path.join(audio_dir, f"seg{str(num).zfill(5)}.qcbest.wav")
+                    while not self.aborted and attempt < max_attempts:
+                        attempt += 1
+                        pq.emit_log(f"[QC] Tentative {attempt}/{max_attempts} — segment {num}...")
+                        pq.emit_log(f"[INFO] Commande : {' '.join(cmd)}")
+                        ok = await self._run_generation_watchdog(cmd, pq, env, seg_chars, main_wav)
+                        if not ok or not os.path.exists(main_wav):
                             break
-                        decoded_line = line.decode('utf-8', errors='ignore').rstrip('\r\n')
-                        pq.emit_log(decoded_line)
+                        vid = get_voice_id()
+                        if not vid:
+                            pq.emit_log(f"[QC] Pas d'empreinte connue pour cette voix — boucle QC désactivée.")
+                            break
+                        result, _err = await qc_score_native(vid, main_wav)
+                        score = result.get("score") if result else None
+                        if score is None:
+                            pq.emit_log(f"[QC] Score n/a (chunk < 0.3 s) — segment {num} conservé.")
+                            break
+                        score_pct = round(score * 100)
+                        pq.emit_log(f"[QC] Score : {score_pct}% (seuil : {qc_threshold:.0f}%)")
+                        # Mémoriser la meilleure tentative
+                        if best_pct is None or score_pct > best_pct:
+                            best_pct = score_pct
+                            try:
+                                shutil.copyfile(main_wav, best_tmp)
+                            except Exception:
+                                pass
+                        if score_pct >= qc_threshold:
+                            passed = True
+                            pq.emit_log(f"[QC] ✓ Segment {num} validé ({score_pct}% ≥ {qc_threshold:.0f}%).")
+                            break
+                        if attempt < max_attempts and not self.aborted:
+                            pq.emit_log(f"[QC] Insuffisant (meilleur : {best_pct}%) — nouvelle tentative...")
+                    # Repli : si aucune tentative n'a passé le seuil, restaurer la meilleure.
+                    if not passed and best_pct is not None and os.path.exists(best_tmp):
+                        try:
+                            shutil.move(best_tmp, main_wav)
+                            pq.emit_log(f"[QC] ⚠ Seuil non atteint en {attempt} tentative(s) — meilleure version conservée ({best_pct}%).")
+                        except Exception:
+                            pass
+                    if os.path.exists(best_tmp):
+                        try:
+                            os.remove(best_tmp)
+                        except Exception:
+                            pass
+                    # Écrire le score final dans le JSON
+                    await run_auto_evaluation(project_name, num, pq)
 
-                    await self.active_process.wait()
-                    if self.active_process.returncode == 0:
-                        # Calibrage : durée réelle observée pour ce segment.
-                        if seg_chars > 0:
-                            duration_ms = (time.monotonic() - gen_start) * 1000.0
-                            eng, msz = get_tts_engine_model()
-                            update_tts_speed(eng, msz, seg_chars, duration_ms)
+                else:
+                    # Multi-version : pour CHAQUE slot (version 1..N), on fait jusqu'à
+                    # max_attempts essais et on garde le MEILLEUR de la série (ou on
+                    # s'arrête dès qu'un essai passe le seuil). Au final on a N WAV =
+                    # les N meilleurs, comparables même si aucun n'atteint le seuil.
+                    produced = 0
+                    for slot in range(1, versions + 1):
+                        if self.aborted:
+                            break
+                        best_pct = None
+                        best_tmp = os.path.join(audio_dir, f"seg{str(num).zfill(5)}.qcbest.wav")
+                        passed   = False
+                        attempt  = 0
+                        while not self.aborted and attempt < max_attempts:
+                            attempt += 1
+                            pq.emit_log(f"[QC] Version {slot}/{versions} — tentative {attempt}/{max_attempts} (meilleur : {best_pct if best_pct is not None else '—'}%) — seg {num}...")
+                            pq.emit_log(f"[INFO] Commande : {' '.join(cmd)}")
+                            ok = await self._run_generation_watchdog(cmd, pq, env, seg_chars, main_wav)
+                            if not ok or not os.path.exists(main_wav):
+                                break
+                            vid = get_voice_id()
+                            result = None
+                            if vid:
+                                result, _err = await qc_score_native(vid, main_wav)
+                            score = result.get("score") if result else None
+                            if not vid or score is None:
+                                # Pas d'empreinte / chunk trop court → accepter tel quel
+                                dst = os.path.join(audio_dir, f"seg{str(num).zfill(5)}_v{slot}.wav")
+                                os.replace(main_wav, dst)
+                                best_pct = None
+                                passed = True
+                                reason = "pas d'empreinte" if not vid else "n/a — chunk court"
+                                pq.emit_log(f"[QC] ✓ Version {slot}/{versions} acceptée ({reason}).")
+                                break
+                            score_pct = round(score * 100)
+                            pq.emit_log(f"[QC] Score : {score_pct}% (seuil : {qc_threshold:.0f}%)")
+                            if best_pct is None or score_pct > best_pct:
+                                best_pct = score_pct
+                                try:
+                                    shutil.copyfile(main_wav, best_tmp)
+                                except Exception:
+                                    pass
+                            if score_pct >= qc_threshold:
+                                dst = os.path.join(audio_dir, f"seg{str(num).zfill(5)}_v{slot}.wav")
+                                os.replace(main_wav, dst)
+                                passed = True
+                                pq.emit_log(f"[QC] ✓ Version {slot}/{versions} validée ({score_pct}% ≥ {qc_threshold:.0f}%) en {attempt} essai(s).")
+                                break
+                            if attempt < max_attempts and not self.aborted:
+                                pq.emit_log(f"[QC] Insuffisant — nouvel essai pour la version {slot}...")
+                        # Fin de la série : si pas passé, garder le meilleur de la série.
+                        if not passed and best_pct is not None and os.path.exists(best_tmp):
+                            dst = os.path.join(audio_dir, f"seg{str(num).zfill(5)}_v{slot}.wav")
+                            try:
+                                os.replace(best_tmp, dst)
+                                pq.emit_log(f"[QC] ⚠ Version {slot}/{versions} : seuil non atteint — meilleur de la série conservé ({best_pct}%).")
+                            except Exception:
+                                pass
+                        if os.path.exists(best_tmp):
+                            try:
+                                os.remove(best_tmp)
+                            except Exception:
+                                pass
+                        if os.path.exists(os.path.join(audio_dir, f"seg{str(num).zfill(5)}_v{slot}.wav")):
+                            produced += 1
+                    pq.emit_log(f"[QC] Terminé : {produced}/{versions} version(s) produite(s) pour le segment {num}.")
+
+            else:
+                # ── MODE NORMAL ──────────────────────────────────────────────
+                runs = range(1, versions + 1) if versions > 1 else [0]
+                for run_idx in runs:
+                    run_desc = f"version {run_idx}" if versions > 1 else "unique"
+                    pq.emit_log(f"[INFO] Traitement du segment {num} ({run_desc}) pour '{project_name}' ...")
+                    pq.emit_log(f"[INFO] Commande : {' '.join(cmd)}")
+                    ok = await self._run_generation_watchdog(cmd, pq, env, seg_chars, main_wav)
+                    if ok:
                         if versions > 1:
-                            main_wav_name = f"seg{str(num).zfill(5)}.wav"
-                            version_wav_name = f"seg{str(num).zfill(5)}_v{run_idx}.wav"
-                            main_wav_path = os.path.join(audio_dir, main_wav_name)
-                            version_wav_path = os.path.join(audio_dir, version_wav_name)
-                            if os.path.exists(main_wav_path):
-                                if os.path.exists(version_wav_path):
-                                    os.remove(version_wav_path)
-                                os.rename(main_wav_path, version_wav_path)
-                                pq.emit_log(f"[INFO] Fichier renommé en {version_wav_name}")
+                            version_wav = os.path.join(audio_dir, f"seg{str(num).zfill(5)}_v{run_idx}.wav")
+                            if os.path.exists(main_wav):
+                                if os.path.exists(version_wav):
+                                    os.remove(version_wav)
+                                os.rename(main_wav, version_wav)
+                                pq.emit_log(f"[INFO] Fichier renommé en seg{str(num).zfill(5)}_v{run_idx}.wav")
                             pq.emit_log(f"[INFO] Segment {num} ({run_desc}) généré avec succès.")
                         else:
                             await run_auto_evaluation(project_name, num, pq)
@@ -561,19 +1062,20 @@ class GlobalTTSQueue:
                         if self.aborted:
                             pq.emit_log(f"[INFO] Génération annulée par l'utilisateur.")
                         else:
-                            pq.emit_log(f"[ERREUR] Le segment {num} ({run_desc}) a échoué (code de sortie: {self.active_process.returncode})")
-                except Exception as e:
-                    if self.aborted:
-                        pq.emit_log(f"[INFO] Génération annulée par l'utilisateur.")
-                    else:
-                        pq.emit_log(f"[ERREUR] Impossible de lancer la génération pour le segment {num}: {str(e)}")
-                finally:
-                    self.active_process = None
+                            pq.emit_log(f"[ERREUR] Segment {num} ({run_desc}) a échoué.")
+
+            # Nouvel audio produit → « non écouté » (read=0) + on efface tout statut
+            # QC manuel obsolète (forced/accepted). Le segment est alors jugé
+            # UNIQUEMENT par sa note vs son seuil : au-dessus = auto-fiable (masqué),
+            # en-dessous = affiché (à traiter). Pas de validation manuelle du « bon ».
+            if not self.aborted:
+                set_segment_read(project_name, num, 0)
+                set_segment_qc_status(project_name, num, None)
 
             pq.active_segment = None
             if project_name in segment_cache:
                 segment_cache[project_name] = {}
-            
+
         self.active_task = None
 
     async def stop(self):
@@ -712,8 +1214,9 @@ async def upload_file(name: str, file: UploadFile = File(...)):
         if ext not in [".txt", ".pdf"]:
             raise HTTPException(status_code=400, detail="Seuls les fichiers .pdf et .txt sont acceptés")
     else:
-        if ext not in [".epub"]:
-            raise HTTPException(status_code=400, detail="Seuls les fichiers .epub sont acceptés")
+        # Roman : EPUB ou PDF (PDF souvent plus simple à linéariser).
+        if ext not in [".epub", ".pdf"]:
+            raise HTTPException(status_code=400, detail="Seuls les fichiers .epub et .pdf sont acceptés")
         
     dest_path = os.path.join(book_dir, filename)
     try:
@@ -723,6 +1226,34 @@ async def upload_file(name: str, file: UploadFile = File(...)):
         return {"filename": filename, "message": f"Fichier {ext.upper()[1:]} téléversé avec succès"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def get_wav_duration(wav_path: str) -> float | None:
+    try:
+        import struct
+        with open(wav_path, 'rb') as f:
+            riff = f.read(12)
+            if riff[0:4] != b'RIFF' or riff[8:12] != b'WAVE':
+                return None
+            while True:
+                chunk_header = f.read(8)
+                if len(chunk_header) < 8:
+                    break
+                chunk_id, chunk_size = struct.unpack('<4sI', chunk_header)
+                if chunk_id == b'fmt ':
+                    fmt_data = f.read(chunk_size)
+                    sample_rate = struct.unpack('<I', fmt_data[4:8])[0]
+                    bits_per_sample = struct.unpack('<H', fmt_data[14:16])[0]
+                    num_channels = struct.unpack('<H', fmt_data[2:4])[0]
+                elif chunk_id == b'data':
+                    bytes_per_sample = bits_per_sample // 8
+                    duration = chunk_size / (sample_rate * num_channels * bytes_per_sample)
+                    return duration
+                else:
+                    f.seek(chunk_size, 1)
+    except Exception:
+        pass
+    return None
 
 
 @app.get("/api/projects/{name}")
@@ -850,12 +1381,24 @@ def get_project_details(name: str):
             text = data.get("text", "")
             generated_voice = data.get("generated_voice")
             qc_score = data.get("qc_score")
-            if project_type == "theatre":
+            qc_duration = data.get("qc_duration")
+            if project_type in ("theatre", "novel_multi"):
                 characters.add(profile_id)
                 
             wav_name = filename.replace(".json", ".wav")
             has_wav = idx in existing_wavs
             wav_mtime = wav_mtimes.get(idx) if has_wav else None
+
+            if qc_duration is None and has_wav:
+                wav_path = os.path.join(audio_dir, wav_name)
+                qc_duration = get_wav_duration(wav_path)
+                if qc_duration is not None:
+                    data["qc_duration"] = qc_duration
+                    try:
+                        with open(seg_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
             
             available_versions = versions_map.get(idx, [])
             available_versions = sorted(available_versions, key=lambda x: int(x[1:]) if x[1:].isdigit() else 0)
@@ -870,7 +1413,14 @@ def get_project_details(name: str):
                 "available_versions": available_versions,
                 "generated_voice": generated_voice,
                 "audio_mtime": wav_mtime,
-                "qc_score": qc_score
+                "qc_score": qc_score,
+                "duration": qc_duration,
+                # 0 = audio non écouté (nouveau, à tester), 1 = écouté/validé.
+                # Absent (audio antérieur à la fonctionnalité) → considéré lu.
+                "read": data.get("read", 1) if has_wav else 1,
+                # Statut QC manuel : 'forced' (override clic droit) / 'accepted'
+                # (validé) / None. Ignoré par le tableau QC si non-None.
+                "qc_status": data.get("qc_status"),
             })
     elif len(text_segs) > 0:
         # Backward compatibility: Load from book/*.txt (for old novels)
@@ -908,7 +1458,9 @@ def get_project_details(name: str):
                 "available_versions": available_versions,
                 "generated_voice": None,
                 "audio_mtime": wav_mtime,
-                "qc_score": None
+                "qc_score": None,
+                "read": 1,
+                "qc_status": None,
             })
             
     # Check EPUB/TXT/PDF files in book folder
@@ -952,14 +1504,6 @@ def get_project_details(name: str):
         {"num": item["num"], "voice": item["voice"], "versions": item["versions"], "global_position": idx + 1}
         for idx, item in enumerate(global_tts_queue.pending_tasks)
     ]
-    # Scan for QC reference files
-    qc_dir = os.path.join(path, "QC")
-    qc_references = []
-    if os.path.exists(qc_dir):
-        for f in os.listdir(qc_dir):
-            if f.startswith("ref_") and f.endswith(".npy"):
-                qc_references.append(f[4:-4])
-
     if project_type == "theatre":
         if "DIDAS" not in custom_characters:
             custom_characters.append("DIDAS")
@@ -972,6 +1516,13 @@ def get_project_details(name: str):
                     json.dump(meta_data, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 print(f"[WARN] Error updating meta.json with default custom characters: {e}")
+    elif project_type == "novel_multi":
+        # NARRATEUR est le personnage originel (équivalent de DIDAS au théâtre).
+        # On fusionne persos déclarés + détectés dans les segments, +NARRATEUR,
+        # et on trie alphabétiquement (comme le théâtre).
+        merged = set(custom_characters) | set(characters) | {"NARRATEUR"}
+        merged.discard("Narrator")  # doublon technique du narrateur par défaut
+        custom_characters = sorted(merged)
 
     response_data = {
         "name": name,
@@ -986,13 +1537,18 @@ def get_project_details(name: str):
         "segments": segments,
         "characters": sorted(list(characters)),
         "custom_characters": custom_characters,
+        # Personnages 'vus' dans les analyses IA enregistrées (≠ détectés dans les TTS).
+        "ai_seen_characters": _ai_seen_characters(name),
         "voice_mapping": voice_mapping,
         "mp3_files": mp3_files,
         "active_segment": active_seg,
         "pending_segments": pending_segments,
         "global_queue_active": global_queue_active,
-        "qc_references": qc_references,
         "normalization_rules": meta_data.get("normalization_rules", []),
+        # Seuils par rôle DÉRIVÉS du store central par voix (via voice_mapping).
+        "qc_thresholds": build_role_thresholds(voice_mapping),
+        # Voix réellement utilisées + leurs seuils centraux (édition par voix).
+        "voices_used": build_voices_used(segments),
         "piece_style": meta_data.get("piece_style", "modern"),
         "custom_play_styles": (
             json.load(open(os.path.join(PRESETS_DIR, "custom_play_styles.json"), "r", encoding="utf-8"))
@@ -1052,6 +1608,8 @@ async def select_segment_version(name: str, num: int, data: VersionSelectionRequ
 
     # Auto-evaluate similarity
     await run_auto_evaluation(name, num)
+    # Sélectionner une version = l'avoir écoutée/validée → read=1.
+    set_segment_read(name, num, 1)
 
     if name in segment_cache:
         segment_cache[name] = {}
@@ -1060,6 +1618,38 @@ async def select_segment_version(name: str, num: int, data: VersionSelectionRequ
         "message": f"Version {data.version} validée pour le segment {num}. {deleted_count} versions alternatives supprimées.",
         "audio_url": f"/audio/{name}/audio/{prefix}.wav"
     }
+
+
+@app.post("/api/projects/{name}/segments/{num}/mark_read")
+async def mark_segment_read(name: str, num: int, value: int = Query(1)):
+    """Marque un segment comme écouté (read=1) ou non (read=0), persistant en JSON."""
+    project_dir = os.path.join(PROJECTS_DIR, name)
+    if not os.path.exists(project_dir) or not os.path.isdir(project_dir):
+        raise HTTPException(status_code=404, detail="Projet introuvable")
+    json_path = os.path.join(project_dir, "tts", f"seg{str(num).zfill(5)}.json")
+    if not os.path.exists(json_path):
+        raise HTTPException(status_code=404, detail="Segment introuvable")
+    set_segment_read(name, num, value)
+    if name in segment_cache:
+        segment_cache[name] = {}
+    return {"num": num, "read": int(value)}
+
+
+@app.post("/api/projects/{name}/segments/{num}/qc_status")
+async def set_segment_qc_status_ep(name: str, num: int, status: str = Query("forced")):
+    """Pose/retire le statut QC manuel d'un segment (forced / accepted / clear)."""
+    project_dir = os.path.join(PROJECTS_DIR, name)
+    if not os.path.exists(project_dir) or not os.path.isdir(project_dir):
+        raise HTTPException(status_code=404, detail="Projet introuvable")
+    json_path = os.path.join(project_dir, "tts", f"seg{str(num).zfill(5)}.json")
+    if not os.path.exists(json_path):
+        raise HTTPException(status_code=404, detail="Segment introuvable")
+    if status not in ("forced", "accepted", "clear"):
+        raise HTTPException(status_code=400, detail="Statut invalide (forced/accepted/clear).")
+    set_segment_qc_status(name, num, status)
+    if name in segment_cache:
+        segment_cache[name] = {}
+    return {"num": num, "qc_status": None if status == "clear" else status}
 
 
 
@@ -1372,164 +1962,291 @@ def delete_segment(name: str, num: int):
     return {"message": f"Segment {num} supprimé et fichiers réalignés."}
 
 
-@app.post("/api/projects/{name}/voiceprint")
-async def create_voiceprint(name: str, req: VoiceprintRequest):
-    """Creates a voiceprint reference file for an actor using the isolated QC venv."""
-    project_dir = os.path.join(PROJECTS_DIR, name)
-    if not os.path.exists(project_dir) or not os.path.isdir(project_dir):
-        raise HTTPException(status_code=404, detail="Projet introuvable")
-
-    wav_name = f"seg{str(req.segment_num).zfill(5)}.wav"
-    wav_path = os.path.join(project_dir, "audio", wav_name)
-
-    if not os.path.exists(wav_path):
-        raise HTTPException(status_code=400, detail=f"Le fichier audio {wav_name} n'existe pas. Veuillez le générer d'abord.")
-
-    qc_dir = os.path.join(project_dir, "QC")
-    os.makedirs(qc_dir, exist_ok=True)
-
-    dest_npy = os.path.join(qc_dir, f"ref_{req.actor.strip()}.npy")
-
-    try:
-        ok, output_text = await qc_create_voiceprint(wav_path, dest_npy)
-        if not ok:
-            raise Exception(output_text or "Le fichier d'empreinte n'a pas été créé.")
-        return {"message": f"Empreinte de référence créée avec succès pour {req.actor} !", "log": output_text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la génération de l'empreinte : {str(e)}")
-
-
 @app.post("/api/projects/{name}/segments/{num}/qc_score")
 async def get_segment_qc_score(name: str, num: int):
-    """Computes the similarity score for a segment against its actor's reference voiceprint."""
+    """Recalcule (natif) le score QC d'un segment contre l'empreinte de sa voix.
+
+    Utilise `generated_voice` du segment → bibliothèque d'empreintes → scoring
+    corrigé par la durée. Écrit qc_score dans le JSON (peut être None = n/a).
+    """
     project_dir = os.path.join(PROJECTS_DIR, name)
     if not os.path.exists(project_dir) or not os.path.isdir(project_dir):
         raise HTTPException(status_code=404, detail="Projet introuvable")
 
-    # Resolve project type
-    meta_path = os.path.join(project_dir, "meta.json")
-    project_type = "novel"
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta_data = json.load(f)
-            project_type = meta_data.get("type", "novel")
-        except Exception:
-            pass
-
-    # 1. Find actor name from segment JSON
     tts_dir = os.path.join(project_dir, "tts")
     json_name = f"seg{str(num).zfill(5)}.json"
     json_path = os.path.join(tts_dir, json_name)
-    
-    actor = "Narrator"
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                seg_data = json.load(f)
-            actor = "Narrator" if project_type in ["novel", "novel_multi"] else seg_data.get("profile_id", "Narrator")
-        except Exception:
-            pass
+    if not os.path.exists(json_path):
+        raise HTTPException(status_code=404, detail="Segment introuvable")
 
-    # 2. Check reference voiceprint
-    qc_dir = os.path.join(project_dir, "QC")
-    ref_npy = os.path.join(qc_dir, f"ref_{actor.strip()}.npy")
-    if not os.path.exists(ref_npy):
-        raise HTTPException(status_code=400, detail=f"Empreinte de référence manquante pour l'acteur '{actor}'")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            seg_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lecture du segment impossible : {e}")
 
-    # 3. Check target WAV file
+    voice_name = resolve_segment_voice_name(name, seg_data)
+    # Empreinte créée à la volée depuis VoiceBox si absente.
+    voice_id = await asyncio.to_thread(ensure_voiceprint_for_name, voice_name)
+    if not voice_id:
+        raise HTTPException(status_code=400, detail=f"Aucune empreinte pour la voix '{voice_name}' (échantillon VoiceBox manquant ?).")
+
     wav_name = f"seg{str(num).zfill(5)}.wav"
     wav_path = os.path.join(project_dir, "audio", wav_name)
     if not os.path.exists(wav_path):
         raise HTTPException(status_code=400, detail="Fichier audio du segment introuvable. Veuillez d'abord le générer.")
 
+    result, err = await qc_score_native(voice_id, wav_path)
+    if result is None:
+        raise HTTPException(status_code=500, detail=f"Erreur de calcul du score QC : {err}")
+
+    seg_data["qc_score"] = result.get("score")
+    seg_data["qc_duration"] = result.get("duration")
     try:
-        score, output_text = await qc_compute_score(ref_npy, wav_path)
-
-        if score is None:
-            raise Exception(f"Impossible de lire le score dans la sortie du script. Log:\n{output_text}")
-
-        # Save score back to segment JSON
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    seg_data = json.load(f)
-                seg_data["qc_score"] = score
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(seg_data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"[WARN] Failed to write qc_score to JSON: {e}")
-
-        return {"score": score, "actor": actor}
-
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(seg_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur de calcul du score QC : {str(e)}")
+        print(f"[WARN] Failed to write qc_score to JSON: {e}")
+
+    if name in segment_cache:
+        segment_cache[name].pop(json_name, None)
+
+    return {
+        "score": result.get("score"),
+        "voice": voice_name,
+        "duration": result.get("duration"),
+        "matched_ref_sec": result.get("matched_ref_sec"),
+    }
 
 
-@app.post("/api/projects/{name}/actors/{actor}/verify_batch")
-async def verify_batch_qc(name: str, actor: str):
+@app.get("/api/projects/{name}/segments/{num}/versions_qc")
+async def versions_qc(name: str, num: int):
+    """Score QC de chaque version d'un segment (pour la modal de sélection).
+
+    Note chaque WAV `seg{num}_vN.wav` (+ le principal s'il existe) contre la
+    voix du segment, avec correction de durée. Sert à comparer les versions
+    à l'oreille + au score.
+    """
     project_dir = os.path.join(PROJECTS_DIR, name)
-    if not os.path.exists(project_dir) or not os.path.isdir(project_dir):
+    if not os.path.isdir(project_dir):
         raise HTTPException(status_code=404, detail="Projet introuvable")
 
-    # Resolve project type
-    meta_path = os.path.join(project_dir, "meta.json")
-    project_type = "novel"
-    if os.path.exists(meta_path):
+    tts_dir = os.path.join(project_dir, "tts")
+    audio_dir = os.path.join(project_dir, "audio")
+    json_path = os.path.join(tts_dir, f"seg{str(num).zfill(5)}.json")
+
+    voice_name = None
+    if os.path.exists(json_path):
         try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta_data = json.load(f)
-            project_type = meta_data.get("type", "novel")
+            with open(json_path, "r", encoding="utf-8") as f:
+                seg = json.load(f)
+            voice_name = resolve_segment_voice_name(name, seg)
         except Exception:
             pass
+    voice_id = await asyncio.to_thread(ensure_voiceprint_for_name, voice_name) if voice_name else None
 
-    qc_dir = os.path.join(project_dir, "QC")
-    ref_npy = os.path.join(qc_dir, f"ref_{actor.strip()}.npy")
-    if not os.path.exists(ref_npy):
-        raise HTTPException(status_code=400, detail=f"Empreinte de référence manquante pour l'acteur '{actor}'")
+    prefix = f"seg{str(num).zfill(5)}"
+    scores = {}
+    if voice_id and os.path.isdir(audio_dir):
+        for f in sorted(os.listdir(audio_dir)):
+            if not f.endswith(".wav"):
+                continue
+            if f.startswith(prefix + "_v"):
+                version = f[len(prefix) + 1:-4]  # "v1", "v2", ...
+            elif f == prefix + ".wav":
+                version = "main"
+            else:
+                continue
+            result, _err = await qc_score_native(voice_id, os.path.join(audio_dir, f))
+            if result is not None:
+                scores[version] = {
+                    "score": result.get("score"),
+                    "duration": result.get("duration"),
+                    "matched_ref_sec": result.get("matched_ref_sec"),
+                }
+
+    return {"voice": voice_name, "has_voiceprint": bool(voice_id), "scores": scores}
+
+
+RECOMPUTE_QC_CONCURRENCY = 8  # appels parallèles au service QC (évite le séquentiel sur gros projets)
+
+
+@app.get("/api/projects/{name}/qc/recompute")
+async def recompute_qc(name: str, actor: Optional[str] = Query(None)):
+    """Recalcule (natif) le score QC de tous les segments ayant un WAV, en
+    streamant la progression en SSE (comme la génération). Traite les segments
+    par lots parallèles (RECOMPUTE_QC_CONCURRENCY) plutôt qu'un par un : sur
+    un projet de plusieurs milliers de segments, le séquentiel donnait
+    l'impression que « rien ne se passe » (aucun retour, plusieurs minutes).
+
+    - Sans `actor` (ou "all") : tous les segments.
+    - Avec `actor` : uniquement les segments de ce rôle (profile_id).
+    Re-score même les segments déjà notés (les anciens scores étaient faux).
+    """
+    project_dir = os.path.join(PROJECTS_DIR, name)
+    if not os.path.isdir(project_dir):
+        raise HTTPException(status_code=404, detail="Projet introuvable")
 
     tts_dir = os.path.join(project_dir, "tts")
     audio_dir = os.path.join(project_dir, "audio")
 
-    if not os.path.exists(tts_dir):
-        return {"processed": 0, "message": "Aucun segment trouvé."}
+    actor_filter = None
+    if actor and actor.strip().lower() not in ("all", "tous", "tous les acteurs", ""):
+        actor_filter = actor.strip()
 
-    # Find all segments belonging to the actor that have a WAV but no qc_score
-    eligible_segments = []
-    for f in os.listdir(tts_dir):
-        if f.startswith("seg") and f.endswith(".json"):
+    async def stream():
+        if not os.path.isdir(tts_dir):
+            yield "data: [INFO] Aucun segment à évaluer.\n\n"
+            yield "data: [INFO] Commande terminée avec le code de sortie : 0\n\n"
+            return
+
+        eligible = []
+        for f in os.listdir(tts_dir):
+            if not (f.startswith("seg") and f.endswith(".json")):
+                continue
             try:
                 num = int(f[3:8])
-                json_path = os.path.join(tts_dir, f)
-                with open(json_path, "r", encoding="utf-8") as file:
-                    seg_data = json.load(file)
-                
-                seg_actor = "Narrator" if project_type in ["novel", "novel_multi"] else seg_data.get("profile_id", "Narrator")
-                if seg_actor.strip() == actor.strip():
-                    wav_name = f.replace(".json", ".wav")
-                    wav_path = os.path.join(audio_dir, wav_name)
-                    if os.path.exists(wav_path) and seg_data.get("qc_score") is None:
-                        eligible_segments.append(num)
-            except Exception:
+            except ValueError:
                 continue
+            wav = os.path.join(audio_dir, f"seg{str(num).zfill(5)}.wav")
+            if not os.path.exists(wav):
+                continue
+            if actor_filter:
+                try:
+                    with open(os.path.join(tts_dir, f), "r", encoding="utf-8") as fh:
+                        d = json.load(fh)
+                    if (d.get("profile_id") or "").strip() != actor_filter:
+                        continue
+                except Exception:
+                    continue
+            eligible.append(num)
+        eligible.sort()
 
-    eligible_segments.sort()
-    count = 0
-    for num in eligible_segments:
-        try:
-            await run_auto_evaluation(name, num)
-            count += 1
-        except Exception as e:
-            print(f"[WARN] Batch QC failed for segment {num}: {e}")
+        total = len(eligible)
+        yield f"data: [INFO] Recalcul QC natif : {total} segment(s) ({actor_filter or 'tous les acteurs'})...\n\n"
+        if total == 0:
+            yield "data: [INFO] Commande terminée avec le code de sortie : 0\n\n"
+            return
 
-    if count > 0 and name in segment_cache:
-        segment_cache[name] = {}
+        # 1) On REFAIT d'abord l'empreinte depuis l'échantillon VoiceBox ACTUEL,
+        #    pour chaque voix concernée. Essentiel si une voix a été refaite dans
+        #    VoiceBox (échantillon insatisfaisant remplacé) : on re-score les WAV
+        #    contre l'empreinte à jour.
+        voix = set()
+        for num in eligible:
+            try:
+                with open(os.path.join(tts_dir, f"seg{str(num).zfill(5)}.json"), "r", encoding="utf-8") as fh:
+                    sd = json.load(fh)
+                vn = sd.get("generated_voice") or sd.get("profile_id")
+                if vn:
+                    voix.add(vn)
+            except Exception:
+                pass
+        if voix and QC_URL:
+            yield f"data: [INFO] Rafraîchissement des empreintes VoiceBox ({len(voix)} voix)...\n\n"
+            for vn in sorted(voix):
+                try:
+                    vid = await asyncio.to_thread(ensure_voiceprint_for_name, vn, True)
+                    yield f"data: [INFO] Empreinte {'mise à jour' if vid else 'introuvable'} : {vn}\n\n"
+                except Exception as e:
+                    yield f"data: [WARN] Empreinte '{vn}' : {e}\n\n"
 
-    return {
-        "processed": count,
-        "message": f"Calcul par lot terminé : {count} segments évalués pour l'acteur '{actor}'."
-    }
+        sem = asyncio.Semaphore(RECOMPUTE_QC_CONCURRENCY)
+        done_count = 0
+        done_lock = asyncio.Lock()
+        progress_q: asyncio.Queue = asyncio.Queue()
 
+        async def worker(num: int):
+            nonlocal done_count
+            async with sem:
+                try:
+                    await run_auto_evaluation(name, num)
+                except Exception as e:
+                    print(f"[WARN] recompute QC seg {num}: {e}")
+            async with done_lock:
+                done_count += 1
+                await progress_q.put(done_count)
+
+        tasks = [asyncio.create_task(worker(n)) for n in eligible]
+
+        # Émet une ligne de progression toutes les ~25 segments (évite de spammer
+        # la console sur un projet de plusieurs milliers de segments).
+        report_every = max(1, total // 40)
+        last_reported = 0
+        pending = asyncio.gather(*tasks)
+        while not pending.done():
+            try:
+                dc = await asyncio.wait_for(progress_q.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if dc - last_reported >= report_every or dc == total:
+                last_reported = dc
+                pct = round(dc * 100 / total)
+                yield f"data: [INFO] Recalcul QC : {dc}/{total} ({pct}%)\n\n"
+        await pending  # propage une éventuelle exception résiduelle
+
+        if name in segment_cache:
+            segment_cache[name] = {}
+
+        yield f"data: [OK] Recalcul QC terminé : {total} segment(s) re-scorés ({actor_filter or 'tous les acteurs'}).\n\n"
+        yield "data: [INFO] Commande terminée avec le code de sortie : 0\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+class QcThresholdsUpdate(BaseModel):
+    # { "ANTOINE": {"1": 45, "2": 50, "3": 55, "5": 60, "10": 70, "15": 75}, ... }
+    qc_thresholds: Dict[str, Dict[str, float]]
+
+
+class VoiceThresholdsUpdate(BaseModel):
+    # Seuils par voix (voice_id) : { "<voice_id>": {"1": 25, ...}, ... }
+    voice_thresholds: Dict[str, Dict[str, float]]
+
+
+@app.put("/api/projects/{name}/qc_thresholds")
+def update_qc_thresholds(name: str, data: QcThresholdsUpdate):
+    """Enregistre les seuils QC dans le store CENTRAL par voix.
+
+    L'UI envoie les seuils par rôle ; on traduit chaque rôle → voix (via le
+    voice_mapping du projet) et on écrit sous voice_id. Ainsi une voix garde
+    ses exigences dans tous les projets."""
+    path = os.path.join(PROJECTS_DIR, name)
+    if not os.path.isdir(path):
+        raise HTTPException(status_code=404, detail="Projet introuvable")
+    try:
+        mapping = _project_voice_mapping(name)
+        central = load_voice_thresholds()
+        applied = {}
+        for role, buckets in (data.qc_thresholds or {}).items():
+            voice_name = mapping.get(role)
+            vid = resolve_voice_id(voice_name) if voice_name else None
+            if not vid:
+                continue
+            central[vid] = buckets
+            applied[role] = buckets
+        save_voice_thresholds(central)
+        if name in segment_cache:
+            segment_cache[name] = {}
+        return {"message": "Seuils QC enregistrés (centralisés par voix)", "qc_thresholds": applied}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/qc/voice_thresholds")
+def update_voice_thresholds_ep(data: VoiceThresholdsUpdate):
+    """Enregistre directement les seuils par voix (voice_id) dans le store central."""
+    try:
+        central = load_voice_thresholds()
+        for vid, buckets in (data.voice_thresholds or {}).items():
+            if not vid:
+                continue
+            # Ne garder que les buckets renseignés (valeurs vides = retirées).
+            central[vid] = {k: v for k, v in (buckets or {}).items() if v not in (None, "")}
+        save_voice_thresholds(central)
+        return {"message": "Seuils par voix enregistrés", "count": len(data.voice_thresholds or {})}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/api/projects/{name}/voice_mapping")
@@ -1783,6 +2500,497 @@ def get_file_sample(name: str, file_type: str = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =============================================================================
+# IA & Rôles : découpage du roman en chunks à "AInalyser" avec WhoIsSpeakingIA
+# =============================================================================
+
+def _find_novel_source_txt(book_dir: str) -> Optional[str]:
+    """Trouve le fichier texte source d'un roman dans book/.
+    Priorité au texte normalisé (*_formated.txt) puis au source brut.
+    Ignore les seg*, *_parsed.txt, *_chunked.txt."""
+    if not os.path.exists(book_dir):
+        return None
+    txts = [f for f in os.listdir(book_dir) if f.lower().endswith(".txt")
+            and not f.lower().startswith("seg")]
+    formated = [f for f in txts if f.lower().endswith("_formated.txt")]
+    if formated:
+        return formated[0]
+    plain = [f for f in txts if not f.lower().endswith(("_parsed.txt", "_chunked.txt"))]
+    # Écarter les sauvegardes/copies manuelles (GPsave.txt, *_backup.txt, ...).
+    _BACKUP = ("save", "backup", "copy", "copie", "bak", "old")
+    non_backup = [f for f in plain if not any(k in f.lower() for k in _BACKUP)]
+    candidats = non_backup or plain
+    if not candidats:
+        return None
+    # À défaut d'indice, le vrai livre est le plus gros fichier.
+    return max(candidats, key=lambda f: os.path.getsize(os.path.join(book_dir, f)))
+
+
+def _chunk_novel_for_ai(text: str, min_chars: int = 1500, max_chars: int = 2000) -> List[str]:
+    """Découpe le texte en chunks de min..max caractères SANS jamais couper une
+    phrase. On regroupe des paragraphes (séparés par des lignes vides) ; un
+    paragraphe trop long est re-découpé sur les fins de phrase (. ! ? …)."""
+    import re
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paras) <= 1:
+        # texte "aéré" en une phrase par ligne (pas de vraies lignes vides)
+        paras = [l.strip() for l in text.splitlines() if l.strip()]
+
+    def split_paragraphe(p: str) -> List[str]:
+        phrases = re.split(r"(?<=[.!?…»\"])\s+", p)
+        out, buf = [], ""
+        for s in phrases:
+            if not buf:
+                buf = s
+            elif len(buf) + 1 + len(s) <= max_chars:
+                buf += " " + s
+            else:
+                out.append(buf)
+                buf = s
+        if buf:
+            out.append(buf)
+        return out
+
+    unites: List[str] = []
+    for p in paras:
+        if len(p) > max_chars:
+            unites.extend(split_paragraphe(p))
+        else:
+            unites.append(p)
+
+    chunks: List[str] = []
+    buf = ""
+    for u in unites:
+        if not buf:
+            buf = u
+        elif len(buf) + 2 + len(u) <= max_chars:
+            buf += "\n\n" + u
+        else:
+            chunks.append(buf)
+            buf = u
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _ai_chunks_dir(name: str) -> str:
+    return os.path.join(PROJECTS_DIR, name, "book", "ai_chunks")
+
+
+def _analyzed_name(index: int) -> str:
+    return f"chunk_{str(index).zfill(5)}_analyzed.txt"
+
+
+def _chunk_name(index: int) -> str:
+    return f"chunk_{str(index).zfill(5)}.txt"
+
+
+def _list_ai_chunks(name: str) -> List[dict]:
+    d = _ai_chunks_dir(name)
+    if not os.path.exists(d):
+        return []
+    # Fichiers chunk_NNNNN.txt UNIQUEMENT (on exclut les *_analyzed.txt).
+    files = sorted(f for f in os.listdir(d)
+                   if re.fullmatch(r"chunk_\d+\.txt", f.lower()))
+    out = []
+    for f in files:
+        try:
+            with open(os.path.join(d, f), "r", encoding="utf-8") as fh:
+                txt = fh.read()
+        except Exception:
+            txt = ""
+        idx = int(re.search(r"\d+", f).group())
+        preview = " ".join(txt.split())[:140]
+        out.append({
+            "index": idx,
+            "filename": f,
+            "chars": len(txt),
+            "preview": preview,
+            "analyzed": os.path.exists(os.path.join(d, _analyzed_name(idx))),
+        })
+    return out
+
+
+@app.post("/api/projects/{name}/ai_roles/chunk")
+def ai_roles_chunk(name: str, min_chars: int = Query(1500), max_chars: int = Query(2000)):
+    """Découpe le roman en petits fichiers (chunk_00001.txt, ...) dans
+    book/ai_chunks/ en vue de l'analyse d'attribution des rôles par l'IA."""
+    project_dir = os.path.join(PROJECTS_DIR, name)
+    if not os.path.isdir(project_dir):
+        raise HTTPException(status_code=404, detail="Projet introuvable")
+    book_dir = os.path.join(project_dir, "book")
+    src = _find_novel_source_txt(book_dir)
+    if not src:
+        raise HTTPException(status_code=400, detail="Aucun fichier texte source trouvé dans book/.")
+
+    with open(os.path.join(book_dir, src), "r", encoding="utf-8") as f:
+        texte = f.read()
+
+    chunks = _chunk_novel_for_ai(texte, min_chars=min_chars, max_chars=max_chars)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Le texte source est vide.")
+
+    out_dir = _ai_chunks_dir(name)
+    # On repart d'un dossier propre pour éviter de mélanger d'anciens découpages.
+    if os.path.exists(out_dir):
+        for old in os.listdir(out_dir):
+            if old.lower().startswith("chunk_") and old.lower().endswith(".txt"):
+                try:
+                    os.remove(os.path.join(out_dir, old))
+                except Exception:
+                    pass
+    os.makedirs(out_dir, exist_ok=True)
+
+    for i, c in enumerate(chunks, start=1):
+        with open(os.path.join(out_dir, f"chunk_{str(i).zfill(5)}.txt"), "w", encoding="utf-8") as f:
+            f.write(c.strip() + "\n")
+
+    return {
+        "source_file": src,
+        "count": len(chunks),
+        "min_chars": min_chars,
+        "max_chars": max_chars,
+        "chunks": _list_ai_chunks(name),
+    }
+
+
+@app.get("/api/projects/{name}/ai_roles/chunks")
+def ai_roles_list(name: str):
+    """Liste les chunks IA déjà générés pour le projet."""
+    project_dir = os.path.join(PROJECTS_DIR, name)
+    if not os.path.isdir(project_dir):
+        raise HTTPException(status_code=404, detail="Projet introuvable")
+    return {"count": len(_list_ai_chunks(name)), "chunks": _list_ai_chunks(name)}
+
+
+@app.get("/api/projects/{name}/ai_roles/chunks/{index}")
+def ai_roles_get_chunk(name: str, index: int):
+    """Renvoie le contenu d'un chunk IA (1-indexé) + son résultat analysé si présent."""
+    d = _ai_chunks_dir(name)
+    path = os.path.join(d, _chunk_name(index))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Chunk introuvable")
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    analyzed_text = None
+    apath = os.path.join(d, _analyzed_name(index))
+    if os.path.exists(apath):
+        with open(apath, "r", encoding="utf-8") as f:
+            analyzed_text = f.read()
+    return {
+        "index": index,
+        "filename": _chunk_name(index),
+        "text": text,
+        "analyzed": analyzed_text is not None,
+        "analyzed_filename": _analyzed_name(index) if analyzed_text is not None else None,
+        "analyzed_text": analyzed_text,
+    }
+
+
+class AiNarratorBody(BaseModel):
+    text: Optional[str] = None
+
+
+@app.post("/api/projects/{name}/ai_roles/chunks/{index}/narrator")
+def ai_roles_mark_narrator(name: str, index: int, body: Optional[AiNarratorBody] = None):
+    """Marque un chunk comme 100% NARRATEUR (sans IA) : crée
+    chunk_NNNNN_analyzed.txt = 'NARRATEUR\\n\\n' + texte du chunk.
+    Si body.text est fourni (cadre AVANT corrigé), on réécrit d'abord le chunk."""
+    d = _ai_chunks_dir(name)
+    path = os.path.join(d, _chunk_name(index))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Chunk introuvable")
+
+    # Corrections éventuelles depuis le cadre AVANT éditable -> on réécrit le chunk.
+    if body is not None and body.text is not None and body.text.strip():
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body.text.strip() + "\n")
+
+    with open(path, "r", encoding="utf-8") as f:
+        texte = f.read().strip()
+
+    analyzed = "NARRATEUR\n\n" + texte + "\n"
+    apath = os.path.join(d, _analyzed_name(index))
+    with open(apath, "w", encoding="utf-8") as f:
+        f.write(analyzed)
+
+    return {
+        "index": index,
+        "filename": _chunk_name(index),
+        "analyzed_filename": _analyzed_name(index),
+        "analyzed_text": analyzed,
+        "speakers": ["NARRATEUR"],
+    }
+
+
+def _extraire_locuteurs(rendu: str) -> List[str]:
+    """Extrait les noms de locuteurs (lignes MAJUSCULES) du rendu, hors NARRATEUR."""
+    speakers = []
+    for ligne in rendu.split("\n"):
+        l = ligne.strip()
+        # NARRATEUR et le placeholder générique PERSONNAGE ne sont pas des
+        # personnages nommés : on ne les fait pas remonter dans la distribution.
+        if not l or l in ("NARRATEUR", "PERSONNAGE"):
+            continue
+        if l.isupper() and len(l) < 50 and not any(c in l for c in ".!?«»\"–—{}"):
+            if l not in speakers:
+                speakers.append(l)
+    return speakers
+
+
+def _ai_seen_characters(name: str) -> List[str]:
+    """Locuteurs nommés 'vus' dans les analyses enregistrées (chunk_*_analyzed.txt).
+    Sert à marquer un personnage comme 'Vu' même s'il n'est pas encore dans les TTS."""
+    d = _ai_chunks_dir(name)
+    if not os.path.exists(d):
+        return []
+    seen = set()
+    for f in os.listdir(d):
+        if re.fullmatch(r"chunk_\d+_analyzed\.txt", f.lower()):
+            try:
+                with open(os.path.join(d, f), "r", encoding="utf-8") as fh:
+                    seen.update(_extraire_locuteurs(fh.read()))
+            except Exception:
+                pass
+    return sorted(seen)
+
+
+def _ajouter_custom_characters(name: str, speakers: List[str]) -> List[str]:
+    """Ajoute les locuteurs détectés à custom_characters de meta.json (dédupliqué)."""
+    if not speakers:
+        return []
+    meta_path = os.path.join(PROJECTS_DIR, name, "meta.json")
+    meta = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+    existing = list(meta.get("custom_characters", []))
+    ajouts = [s for s in speakers if s not in existing]
+    if ajouts:
+        meta["custom_characters"] = existing + ajouts
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    return ajouts
+
+
+class AiAnalyzedBody(BaseModel):
+    text: str
+
+
+@app.put("/api/projects/{name}/ai_roles/chunks/{index}/analyzed")
+def ai_roles_save_analyzed(name: str, index: int, body: AiAnalyzedBody):
+    """Enregistre (validation manuelle) le contenu corrigé du cadre APRÈS dans
+    chunk_NNNNN_analyzed.txt, et refait remonter les personnages détectés."""
+    d = _ai_chunks_dir(name)
+    if not os.path.exists(os.path.join(d, _chunk_name(index))):
+        raise HTTPException(status_code=404, detail="Chunk introuvable")
+    contenu = (body.text or "").strip()
+    if not contenu:
+        raise HTTPException(status_code=400, detail="Le contenu analysé est vide.")
+
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, _analyzed_name(index)), "w", encoding="utf-8") as f:
+        f.write(contenu + "\n")
+
+    speakers = _extraire_locuteurs(contenu)
+    ajoutes = _ajouter_custom_characters(name, speakers)
+    return {
+        "index": index,
+        "analyzed_filename": _analyzed_name(index),
+        "analyzed_text": contenu + "\n",
+        "speakers": speakers,
+        "added_characters": ajoutes,
+    }
+
+
+@app.post("/api/projects/{name}/ai_roles/concat")
+def ai_roles_concat(name: str):
+    """Concatène tous les chunks VALIDÉS (chunk_NNNNN_analyzed.txt), dans l'ordre,
+    en un unique <base>_parsed.txt (format identique au parsing théâtre : blocs
+    'LOCUTEUR' + texte). Ce fichier peut ensuite être chunké/splitté comme une
+    pièce pour fabriquer les segments du tableau central."""
+    project_dir = os.path.join(PROJECTS_DIR, name)
+    if not os.path.isdir(project_dir):
+        raise HTTPException(status_code=404, detail="Projet introuvable")
+    book_dir = os.path.join(project_dir, "book")
+    d = _ai_chunks_dir(name)
+
+    chunks = _list_ai_chunks(name)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Aucun chunk. Ouvre IA & Rôles pour les générer.")
+
+    parts, missing = [], []
+    for c in sorted(chunks, key=lambda x: x["index"]):
+        apath = os.path.join(d, _analyzed_name(c["index"]))
+        if os.path.exists(apath):
+            with open(apath, "r", encoding="utf-8") as f:
+                txt = f.read().strip()
+            if txt:
+                parts.append(txt)
+        else:
+            missing.append(c["index"])
+
+    if not parts:
+        raise HTTPException(status_code=400, detail="Aucun chunk validé (analyse) à assembler.")
+
+    src = _find_novel_source_txt(book_dir)
+    base = os.path.splitext(src)[0] if src else name
+    out_name = f"{base}_parsed.txt"
+    with open(os.path.join(book_dir, out_name), "w", encoding="utf-8") as f:
+        f.write("\n\n".join(parts) + "\n")
+
+    return {
+        "file": out_name,
+        "included": len(parts),
+        "total": len(chunks),
+        "missing": missing,
+    }
+
+
+def _run_whoisspeaking_analysis(name: str, index: int) -> dict:
+    """Exécute (SYNCHRONE, bloquant) l'analyse d'attribution d'un chunk via
+    tools/AI/WhoIsSpeakingIA.py. Lève une exception en cas d'échec. À appeler
+    dans un thread (asyncio.to_thread) depuis le worker asynchrone."""
+    import subprocess
+
+    d = _ai_chunks_dir(name)
+    path = os.path.join(d, _chunk_name(index))
+    if not os.path.exists(path):
+        raise RuntimeError("Chunk introuvable")
+
+    script = os.path.join(TOOLS_DIR, "AI", "WhoIsSpeakingIA.py")
+    if not os.path.exists(script):
+        raise RuntimeError("WhoIsSpeakingIA.py introuvable dans tools/AI/.")
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("LMSTUDIO_URL", "http://host.docker.internal:1234/v1/chat/completions")
+
+    try:
+        res = subprocess.run(
+            [PYTHON_EXE, script, path],
+            capture_output=True, text=True, encoding="utf-8", env=env, timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("L'analyse IA a expiré (LLM trop lent ou injoignable).")
+
+    if res.returncode != 0:
+        tail = (res.stderr or res.stdout or "").strip()[-500:]
+        raise RuntimeError(f"Échec de l'analyse (LM Studio joignable ?). {tail}")
+
+    produced = os.path.join(d, f"{os.path.splitext(_chunk_name(index))[0]}_ai.txt")
+    if not os.path.exists(produced):
+        raise RuntimeError("L'analyse n'a produit aucun fichier de sortie.")
+    with open(produced, "r", encoding="utf-8") as f:
+        rendu = f.read().strip()
+    try:
+        os.remove(produced)
+    except Exception:
+        pass
+
+    analyzed = rendu + "\n"
+    with open(os.path.join(d, _analyzed_name(index)), "w", encoding="utf-8") as f:
+        f.write(analyzed)
+
+    speakers = _extraire_locuteurs(rendu)
+    ajoutes = _ajouter_custom_characters(name, speakers)
+    return {
+        "analyzed_filename": _analyzed_name(index),
+        "analyzed_text": analyzed,
+        "speakers": speakers,
+        "added_characters": ajoutes,
+    }
+
+
+# --- File d'analyse IA ASYNCHRONE (sérialisée : 1 appel LLM à la fois) --------
+# L'analyse ne bloque plus la requête HTTP (donc plus de dépendance au timeout
+# d'un reverse proxy) : on met en file, un worker unique traite un chunk à la
+# fois (le GPU ne fait qu'un LLM à la fois), et le front interroge le statut.
+_ai_status: Dict[str, dict] = {}          # "projet\x00index" -> {status, error, speakers, added}
+_ai_queue: "Optional[asyncio.Queue]" = None
+_ai_worker: "Optional[asyncio.Task]" = None
+
+
+def _ai_key(name: str, index: int) -> str:
+    return f"{name}\x00{index}"
+
+
+async def _ai_analysis_worker():
+    """Traite la file d'analyses IA, une à la fois."""
+    global _ai_worker
+    try:
+        while True:
+            name, index = await _ai_queue.get()
+            key = _ai_key(name, index)
+            _ai_status[key] = {"status": "running", "updated": time.time()}
+            try:
+                result = await asyncio.to_thread(_run_whoisspeaking_analysis, name, index)
+                _ai_status[key] = {"status": "done", "updated": time.time(),
+                                   "speakers": result["speakers"],
+                                   "added_characters": result["added_characters"]}
+                if name in segment_cache:
+                    segment_cache[name] = {}
+            except Exception as e:
+                _ai_status[key] = {"status": "error", "updated": time.time(), "error": str(e)}
+            finally:
+                _ai_queue.task_done()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _ai_worker = None
+
+
+def _enqueue_analysis(name: str, index: int):
+    """Met un chunk en file d'analyse et (re)démarre le worker au besoin."""
+    global _ai_queue, _ai_worker
+    if _ai_queue is None:
+        _ai_queue = asyncio.Queue()
+    _ai_status[_ai_key(name, index)] = {"status": "queued", "updated": time.time()}
+    _ai_queue.put_nowait((name, index))
+    if _ai_worker is None or _ai_worker.done():
+        _ai_worker = asyncio.create_task(_ai_analysis_worker())
+
+
+@app.post("/api/projects/{name}/ai_roles/chunks/{index}/analyze")
+async def ai_roles_analyze(name: str, index: int, body: Optional[AiNarratorBody] = None):
+    """Met le chunk EN FILE d'analyse IA et rend la main IMMÉDIATEMENT (asynchrone).
+    Le front suit ensuite l'avancement via .../ai_roles/analyze_status.
+    NB : endpoint `async` obligatoire — `_enqueue_analysis` crée une tâche asyncio,
+    ce qui exige de tourner dans la boucle d'événements (pas un thread sync)."""
+    d = _ai_chunks_dir(name)
+    path = os.path.join(d, _chunk_name(index))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Chunk introuvable")
+
+    # Corrections éventuelles du cadre AVANT -> on réécrit le chunk avant analyse.
+    if body is not None and body.text is not None and body.text.strip():
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body.text.strip() + "\n")
+
+    _enqueue_analysis(name, index)
+    return {"index": index, "status": "queued"}
+
+
+@app.get("/api/projects/{name}/ai_roles/analyze_status")
+def ai_roles_analyze_status(name: str):
+    """Statuts d'analyse en cours/terminés pour ce projet : { index: {status,...} }.
+    Le front poll cet endpoint (petites requêtes → insensible au reverse proxy)."""
+    prefix = f"{name}\x00"
+    jobs = {}
+    active = 0
+    for key, val in _ai_status.items():
+        if key.startswith(prefix):
+            idx = int(key.split("\x00", 1)[1])
+            jobs[idx] = val
+            if val.get("status") in ("queued", "running"):
+                active += 1
+    return {"jobs": jobs, "active": active}
+
+
 @app.post("/api/projects/{name}/run_tool_sync")
 def run_tool_sync(name: str, action: str = Query(...)):
     """Executes a pipeline tool script synchronously and returns the output/code."""
@@ -1978,6 +3186,20 @@ def apply_normalization(text: str, remove_page_numbers: bool, piece_style: Union
     if style_config.get("id") == "none":
         import re
         formatted_lines = text.splitlines()
+        # Retrait des numéros de page (lignes purement numériques ou « - 12 - » /
+        # « p. 12 ») — utile pour un roman issu de PDF/EPUB.
+        if remove_page_numbers:
+            kept = []
+            for l in formatted_lines:
+                s = l.strip()
+                if re.match(r"^\d+$", s):
+                    continue
+                if re.match(r"^[-–—]?\s*\d+\s*[-–—]?$", s):
+                    continue
+                if re.match(r"^(page|p\.)\s*\d+$", s, re.IGNORECASE):
+                    continue
+                kept.append(l)
+            formatted_lines = kept
         if rules:
             processed_lines = []
             for line in formatted_lines:
@@ -2309,9 +3531,13 @@ def normalize_apply(name: str, request: NormalizeApplyRequest):
     if not actors:
         actors = ["DIDAS"]
         
-    dest_name = src_file.replace(".txt", "_formated.txt")
-    dest_path = os.path.join(book_dir, dest_name)
-    
+    if request.overwrite_source:
+        dest_name = src_file
+        dest_path = src_path
+    else:
+        dest_name = src_file.replace(".txt", "_formated.txt")
+        dest_path = os.path.join(book_dir, dest_name)
+
     if request.text is not None:
         try:
             with open(dest_path, "w", encoding="utf-8") as f:
@@ -2412,6 +3638,208 @@ def get_voicebox_profiles():
             {"id": "Pierre Arditi", "name": "Pierre Arditi", "language": "fr", "voice_type": "cloned"},
             {"id": "Adriana Karambeu", "name": "Adriana Karambeu", "language": "fr", "voice_type": "cloned"}
         ]
+def _vb_get_json(path: str):
+    """GET JSON depuis l'API VoiceBox."""
+    with urllib.request.urlopen(f"{VOICEBOX_URL}{path}", timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _vb_download(path: str, dest: str):
+    """Télécharge un fichier binaire depuis VoiceBox (ex: audio d'échantillon)."""
+    with urllib.request.urlopen(f"{VOICEBOX_URL}{path}", timeout=120) as r, open(dest, "wb") as f:
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+
+
+def _qc_post_json(path: str, payload: dict):
+    """POST JSON vers le service QC et renvoie la réponse JSON."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{QC_URL}{path}", data=data,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _find_vb_voice_by_name(voice_name: str):
+    """Retrouve une voix VoiceBox par son nom (ou id), tolérant casse/espaces."""
+    if not voice_name:
+        return None
+    try:
+        voices = _vb_get_json("/profiles")
+    except Exception:
+        return None
+    target = _normalize_voice_name(voice_name)
+    for v in voices:
+        if v.get("id") == voice_name or _normalize_voice_name(v.get("name") or "") == target:
+            return v
+    return None
+
+
+def ensure_voiceprint_for_name(voice_name: str, force: bool = False) -> Optional[str]:
+    """Renvoie le voice_id de l'empreinte de `voice_name`. Si l'empreinte n'existe
+    pas encore (ou si `force=True`), la (re)FABRIQUE depuis VoiceBox (échantillon
+    de référence → service QC), met à jour l'index, puis renvoie l'id.
+
+    - `force=False` (défaut) : paresseux — ne fabrique que si absente. Une nouvelle
+      voix VoiceBox est ainsi calibrée automatiquement à sa 1re génération.
+    - `force=True` : refait l'empreinte à partir de l'échantillon VoiceBox ACTUEL
+      (utile si la voix a été refaite dans VoiceBox). En cas d'échec, l'empreinte
+      existante est conservée (jamais de perte)."""
+    existing = resolve_voice_id(voice_name)
+    if existing and not force:
+        return existing
+    if not QC_URL:
+        return existing
+    v = _find_vb_voice_by_name(voice_name)
+    if not v or not v.get("id"):
+        return existing
+    vid = v["id"]
+    vname = v.get("name") or vid
+    try:
+        samples = _vb_get_json(f"/profiles/{vid}/samples")
+    except Exception:
+        samples = []
+    if not samples:
+        return existing
+    sid = samples[0].get("id")
+    os.makedirs(VOICEPRINTS_DIR, exist_ok=True)
+    tmp_dir = os.path.join(PROJECTS_DIR, ".voiceprints_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_wav = os.path.join(tmp_dir, f"{vid}.wav")
+    try:
+        _vb_download(f"/samples/{sid}", tmp_wav)
+        res = _qc_post_json("/voiceprint_save", {"wav_path": tmp_wav, "voice_id": vid})
+    except Exception as e:
+        print(f"[WARN] Empreinte auto échouée pour '{vname}': {e}")
+        return existing
+    finally:
+        if os.path.exists(tmp_wav):
+            try:
+                os.remove(tmp_wav)
+            except Exception:
+                pass
+    try:
+        meta = {"voice_id": vid, "name": vname, "sample_id": sid,
+                "duration_sec": res.get("duration"), "dim": res.get("dim"),
+                "updated_at": time.time()}
+        with open(os.path.join(VOICEPRINTS_DIR, f"{vid}.meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        index_path = os.path.join(VOICEPRINTS_DIR, "index.json")
+        index = {}
+        if os.path.exists(index_path):
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    index = json.load(f)
+            except Exception:
+                index = {}
+        index[vname] = vid
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False, indent=2)
+        ensure_default_voice_thresholds()
+    except Exception as e:
+        print(f"[WARN] Écriture index empreinte '{vname}': {e}")
+    return vid
+
+
+@app.post("/api/qc/voiceprints/sync")
+def sync_voiceprints():
+    """Construit/rafraîchit la bibliothèque d'empreintes à partir des voix VoiceBox.
+
+    Pour chaque voix : récupère son échantillon de référence, le télécharge, et
+    demande au service QC d'en calculer/ranger l'empreinte. Plus besoin de
+    désigner manuellement une référence : chaque voix a la sienne.
+    """
+    if not QC_URL:
+        raise HTTPException(status_code=503, detail="Service QC indisponible (QC_URL non défini).")
+
+    tmp_dir = os.path.join(PROJECTS_DIR, ".voiceprints_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(VOICEPRINTS_DIR, exist_ok=True)
+
+    try:
+        voices = _vb_get_json("/profiles")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Impossible de lister les voix VoiceBox : {e}")
+
+    index, synced, skipped = {}, [], []
+    for v in voices:
+        vid = v.get("id")
+        vname = v.get("name") or vid
+        if not vid:
+            continue
+        try:
+            samples = _vb_get_json(f"/profiles/{vid}/samples")
+        except Exception:
+            samples = []
+        if not samples:
+            skipped.append(vname)
+            continue
+
+        sample = samples[0]  # échantillon de référence
+        sid = sample.get("id")
+        ref_text = sample.get("reference_text") or ""
+        tmp_wav = os.path.join(tmp_dir, f"{vid}.wav")
+        try:
+            _vb_download(f"/samples/{sid}", tmp_wav)
+            res = _qc_post_json("/voiceprint_save", {"wav_path": tmp_wav, "voice_id": vid})
+        except Exception as e:
+            skipped.append(f"{vname} (erreur: {e})")
+            continue
+        finally:
+            if os.path.exists(tmp_wav):
+                try:
+                    os.remove(tmp_wav)
+                except Exception:
+                    pass
+
+        meta = {
+            "voice_id": vid,
+            "name": vname,
+            "sample_id": sid,
+            "duration_sec": res.get("duration"),
+            "ref_text_len": len(ref_text),
+            "dim": res.get("dim"),
+            "updated_at": time.time(),
+        }
+        with open(os.path.join(VOICEPRINTS_DIR, f"{vid}.meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        index[vname] = vid
+        synced.append(vname)
+
+    with open(os.path.join(VOICEPRINTS_DIR, "index.json"), "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+    # Toute nouvelle voix sans réglage reçoit la série par défaut.
+    ensure_default_voice_thresholds()
+
+    return {
+        "synced": len(synced),
+        "skipped": len(skipped),
+        "voices_synced": sorted(synced),
+        "voices_skipped": skipped,
+    }
+
+
+@app.get("/api/qc/voiceprints")
+def list_voiceprints():
+    """Liste les empreintes de voix disponibles (bibliothèque QC)."""
+    result = []
+    if os.path.isdir(VOICEPRINTS_DIR):
+        for f in os.listdir(VOICEPRINTS_DIR):
+            if f.endswith(".meta.json"):
+                try:
+                    with open(os.path.join(VOICEPRINTS_DIR, f), "r", encoding="utf-8") as fh:
+                        result.append(json.load(fh))
+                except Exception:
+                    pass
+    return {"count": len(result), "voiceprints": sorted(result, key=lambda x: x.get("name", ""))}
+
+
 @app.get("/api/tts_speed")
 def get_tts_speed():
     """Renvoie la vitesse TTS mesurée (ms/caractère) pour le moteur/modèle courant.
@@ -2460,8 +3888,10 @@ async def enqueue_segments(name: str, req: QueueRequest):
     else:
         segment_nums = parse_ranges(req.ranges)
 
-    global_tts_queue.add_segments(name, segment_nums, req.voice, project_type, req.versions or 1)
-    
+    global_tts_queue.add_segments(name, segment_nums, req.voice, project_type,
+                                   req.versions or 1, req.qc_threshold, req.max_attempts or 20,
+                                   bool(req.qc_batch))
+
     pq = get_project_queue(name)
     pending_segments = [
         {"num": item["num"], "voice": item["voice"], "versions": item["versions"], "global_position": idx + 1}
@@ -2501,7 +3931,10 @@ async def run_tool_sse(
     voice: Optional[str] = Query(None),
     play_type: Optional[str] = Query(None),
     output_name: Optional[str] = Query(None),
-    versions: Optional[int] = Query(1)
+    versions: Optional[int] = Query(1),
+    qc_threshold: Optional[float] = Query(None),
+    max_attempts: Optional[int] = Query(20),
+    qc_batch: Optional[bool] = Query(False),
 ):
     """
     Executes script in a subprocess and streams output logs live via SSE.
@@ -2516,9 +3949,24 @@ async def run_tool_sse(
                 if f.lower().endswith(".pdf"):
                     pdf_file = f
                     break
+
+        # Type de projet : détermine le convertisseur PDF (théâtre = italique→
+        # parenthèses ; roman = texte brut, images ignorées).
+        proj_type = "novel"
+        meta_p = os.path.join(PROJECTS_DIR, name, "meta.json")
+        if os.path.exists(meta_p):
+            try:
+                with open(meta_p, "r", encoding="utf-8") as f:
+                    proj_type = json.load(f).get("type", "novel")
+            except Exception:
+                pass
+
         if pdf_file:
-            script_path = os.path.join(TOOLS_DIR, "convertpdftoabs_theatre.py")
             pdf_path = os.path.join(book_dir, pdf_file)
+            if proj_type == "theatre":
+                script_path = os.path.join(TOOLS_DIR, "convertpdftoabs_theatre.py")
+            else:
+                script_path = os.path.join(TOOLS_DIR, "convertpdftotxt_novel.py")
             cmd = [PYTHON_EXE, script_path, pdf_path]
         else:
             # Extract epub to txt
@@ -2602,6 +4050,12 @@ async def run_tool_sse(
         script_path = os.path.join(TOOLS_DIR, "chunker_book.py")
         cmd = [PYTHON_EXE, script_path, src_path, dest_path]
         
+    elif action == "split_theatre":
+        # Force le splitter théâtre (utilisé aussi par les romans à personnages
+        # une fois les rôles distribués + assemblés en _parsed.txt puis _chunked.txt).
+        script_path = os.path.join(TOOLS_DIR, "split_theatre.py")
+        cmd = [PYTHON_EXE, script_path, name]
+
     elif action == "split":
         # Determine project type from meta.json or dynamic fallback
         project_dir = os.path.join(PROJECTS_DIR, name)
@@ -2620,14 +4074,14 @@ async def run_tool_sse(
             if os.path.exists(book_dir):
                 has_parsed_file = any(f.lower().endswith("_parsed.txt") for f in os.listdir(book_dir))
             project_type = "theatre" if has_parsed_file else "novel"
-            
+
         if project_type == "theatre":
             script_path = os.path.join(TOOLS_DIR, "split_theatre.py")
             cmd = [PYTHON_EXE, script_path, name]
         else:
             script_path = os.path.join(TOOLS_DIR, "split_book.py")
             cmd = [PYTHON_EXE, script_path, name]
-            
+
     elif action == "generate":
         project_dir = os.path.join(PROJECTS_DIR, name)
         meta_path = os.path.join(project_dir, "meta.json")
@@ -2651,7 +4105,9 @@ async def run_tool_sse(
         else:
             segment_nums = parse_ranges(ranges)
 
-        global_tts_queue.add_segments(name, segment_nums, voice, project_type, versions or 1)
+        global_tts_queue.add_segments(name, segment_nums, voice, project_type,
+                                       versions or 1, qc_threshold, max_attempts or 20,
+                                       bool(qc_batch))
         pq = get_project_queue(name)
 
         async def generate_and_finish():
@@ -2717,6 +4173,15 @@ async def run_tool_sse(
             yield f"data: [ERREUR] Impossible de lancer le script: {str(e)}\n\n"
 
     return StreamingResponse(log_generator(), media_type="text/event-stream")
+
+
+# Migration unique des seuils QC par projet → store central par voix, puis
+# attribution de la série par défaut à toute voix encore sans réglage.
+try:
+    migrate_qc_thresholds_to_central()
+    ensure_default_voice_thresholds()
+except Exception as _e:
+    print(f"[WARN] Init seuils QC: {_e}")
 
 
 if __name__ == "__main__":
