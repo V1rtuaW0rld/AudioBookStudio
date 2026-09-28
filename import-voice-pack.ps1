@@ -11,8 +11,9 @@ Set-Location $root
 
 if (-not (Test-Path $ZipPath)) {
     Write-Host "`n[ERREUR] Fichier introuvable : $ZipPath" -ForegroundColor Red
-    Write-Host "Veuillez télécharger '$ZipPath' depuis la page Releases GitHub :" -ForegroundColor Yellow
-    Write-Host "  -> https://github.com/V1rtuaW0rld/AudioBookStudio/releases`n" -ForegroundColor Cyan
+    Write-Host "Veuillez télécharger le pack de voix depuis le lien Google Drive :" -ForegroundColor Yellow
+    Write-Host "  -> https://drive.google.com/file/d/15ck6aUZO5yD_5G8IthBom7ZQNaHwWzEP/view?usp=sharing" -ForegroundColor Cyan
+    Write-Host "Placez le fichier zip téléchargé à la racine du projet, puis relancez ce script.`n" -ForegroundColor Yellow
     exit 1
 }
 

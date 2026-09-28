@@ -66,7 +66,7 @@ AudioBookStudio vient s'articuler autour de VoiceBox pour apporter tout ce qui m
    - Détecte instantanément si le modèle a dérivé, bafouillé ou changé de timbre.
 
 5. **Pack de 80+ voix françaises préconfigurées** :
-   - Des voix de narrateurs et d'acteurs de premier plan (Pierre Arditi, Jean-Pierre Marielle, Catherine Frot, Gérard Depardieu, les voix de la trilogie marseillaise de Marcel Pagnol, etc.) téléchargeables directement dans les [Releases](https://github.com/V1rtuaW0rld/AudioBookStudio/releases/tag/v1.0.0).
+   - Des voix de narrateurs et d'acteurs de premier plan (Pierre Arditi, Jean-Pierre Marielle, Catherine Frot, Gérard Depardieu, les voix de la trilogie marseillaise de Marcel Pagnol, etc.) téléchargeables via [Google Drive](https://drive.google.com/file/d/15ck6aUZO5yD_5G8IthBom7ZQNaHwWzEP/view?usp=sharing).
 
 ---
 
@@ -84,13 +84,19 @@ cd AudioBookStudio
 
 ### 2. Installer le pack de voix françaises (Recommandé)
 Pour disposer immédiatement des 80+ voix françaises dans votre studio sans devoir les cloner une à une :
-1. Rendez-vous sur la page des [Releases](https://github.com/V1rtuaW0rld/AudioBookStudio/releases/tag/v1.0.0).
-2. Téléchargez le fichier **`AudioBookStudio-French-Voices-v1.0.zip`** (62 Mo) et placez-le à la racine du dossier `AudioBookStudio`.
-3. Sous PowerShell, exécutez simplement :
-```powershell
-.\import-voice-pack.ps1
-```
-*(Vos profils et échantillons de référence sont automatiquement décompressés et configurés dans `VoiceBox/data`).*
+1. Téléchargez le pack zip (62 Mo) :  
+   👉 **[Télécharger le pack de voix (Google Drive)](https://drive.google.com/file/d/15ck6aUZO5yD_5G8IthBom7ZQNaHwWzEP/view?usp=sharing)**
+2. **Installation automatique (Windows / PowerShell)** :  
+   Placez le fichier zip téléchargé à la racine du projet `AudioBookStudio` et lancez :
+   ```powershell
+   .\import-voice-pack.ps1
+   ```
+3. **Installation manuelle (Linux / macOS / sans script)** :  
+   Extrayez simplement le contenu du zip dans le dossier `VoiceBox/data/`.  
+   *(Vous devez retrouver le fichier `VoiceBox/data/voicebox.db` et le sous-dossier `VoiceBox/data/profiles/`).*
+
+> **💡 Comment ça fonctionne ?**  
+> VoiceBox s'appuie sur une base SQLite (`voicebox.db`) qui catalogue les profils (noms des personnages, descriptions, textes de référence) et sur un dossier `profiles/` contenant les fichiers audio `.wav` d'apprentissage. En extrayant ce pack dans `VoiceBox/data`, VoiceBox charge automatiquement toutes les voix au démarrage.
 
 ### 3. Lancer l'application
 Sous Windows (PowerShell) :
@@ -196,7 +202,7 @@ AudioBookStudio wraps around VoiceBox to provide the complete literary pipeline:
    - Instantly flags segments where the model hallucinated, drifted, or changed pitch.
 
 5. **Pack of 80+ Pre-Configured French Voices**:
-   - Iconic narrators, actors, and character voices (Pierre Arditi, Jean-Pierre Marielle, Catherine Frot, Gérard Depardieu, Marcel Pagnol cast, etc.) downloadable directly from the [Releases](https://github.com/V1rtuaW0rld/AudioBookStudio/releases/tag/v1.0.0).
+   - Iconic narrators, actors, and character voices (Pierre Arditi, Jean-Pierre Marielle, Catherine Frot, Gérard Depardieu, Marcel Pagnol cast, etc.) downloadable via [Google Drive](https://drive.google.com/file/d/15ck6aUZO5yD_5G8IthBom7ZQNaHwWzEP/view?usp=sharing).
 
 ---
 
@@ -214,13 +220,19 @@ cd AudioBookStudio
 
 ### 2. Install the Voice Pack (Recommended)
 To immediately get 80+ French voice profiles in your studio without cloning them manually:
-1. Head to the [Releases](https://github.com/V1rtuaW0rld/AudioBookStudio/releases/tag/v1.0.0) page.
-2. Download **`AudioBookStudio-French-Voices-v1.0.zip`** (62 MB) and put it in the root of the `AudioBookStudio` directory.
-3. In PowerShell, simply run:
-```powershell
-.\import-voice-pack.ps1
-```
-*(Your profiles and audio reference clips are automatically extracted and wired into `VoiceBox/data`).*
+1. Download the zip pack (62 MB):  
+   👉 **[Download French Voice Pack (Google Drive)](https://drive.google.com/file/d/15ck6aUZO5yD_5G8IthBom7ZQNaHwWzEP/view?usp=sharing)**
+2. **Automatic installation (Windows / PowerShell)**:  
+   Place the downloaded zip file in the root directory of `AudioBookStudio` and run:
+   ```powershell
+   .\import-voice-pack.ps1
+   ```
+3. **Manual installation (Linux / macOS / no script)**:  
+   Simply extract the zip contents into the `VoiceBox/data/` folder.  
+   *(You should have the file `VoiceBox/data/voicebox.db` and the folder `VoiceBox/data/profiles/`).*
+
+> **💡 How does it work?**  
+> VoiceBox uses an internal SQLite database (`voicebox.db`) to index profiles (character names, descriptions, reference prompts) and a `profiles/` directory containing the `.wav` audio references. By extracting this pack into `VoiceBox/data`, VoiceBox automatically discovers and registers all voices at startup.
 
 ### 3. Start the Application
 On Windows (PowerShell):
