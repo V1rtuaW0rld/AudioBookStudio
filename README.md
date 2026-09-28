@@ -117,11 +117,14 @@ Rendez-vous sur [http://localhost:17493](http://localhost:17493). Si vous avez e
 
 ### Étape 2 : Créer un projet de livre
 Sur [http://localhost:5180](http://localhost:5180), cliquez sur **"Nouveau Projet"** :
+<img width="519" height="425" alt="image" src="https://github.com/user-attachments/assets/8c808331-eee1-4e8c-81fa-899a7bff52d6" />
+
 * Choisissez le type : **Roman (mono-narrateur)**, **Roman (avec personnages)** ou **Théâtre**.
 * Chargez votre fichier source (PDF ou EPUB).
 
 ### Étape 3 : Normaliser le texte
 Ouvrez l'**Atelier de Normalisation**. Utilisez les règles typographiques intégrées pour supprimer les bruits de numérisation, les numéros de page et harmoniser les dialogues. Validez pour enregistrer.
+<img width="1904" height="1056" alt="image" src="https://github.com/user-attachments/assets/24e99f1a-aa4e-451d-8b33-d33c384a93c3" />
 
 ### Étape 4 : Découper ou attribuer les rôles par IA
 * **Pour un roman classique** : Cliquez sur *Créer les segments* pour lancer le découpeur strict.
@@ -244,12 +247,14 @@ Open [http://localhost:17493](http://localhost:17493). If you ran `import-voice-
 
 ### Step 2: Create a Book Project
 On [http://localhost:5180](http://localhost:5180), click **"Nouveau Projet"** (New Project):
+<img width="519" height="425" alt="image" src="https://github.com/user-attachments/assets/6bd7786a-4140-4c28-baef-e2277fc5a8bf" />
+
 * Select the type: **Roman (mono-narrator)**, **Roman (multi-character)**, or **Théâtre** (Play).
 * Upload your PDF or EPUB source file.
 
 ### Step 3: Text Normalization
 Open the **Atelier de Normalisation** (Normalization Workshop). Use the built-in rule builder to strip OCR artifacts and page headers, then save.
-
+<img width="1904" height="1056" alt="image" src="https://github.com/user-attachments/assets/24e99f1a-aa4e-451d-8b33-d33c384a93c3" />
 ### Step 4: Chunk or Assign Roles with AI
 * **Standard single-narrator novel**: Click *Créer les segments* (Create segments) to run the strict sentence chunker.
 * **Multi-voice novel**: Open **🧠 IA & Rôles**. The local LLM separates narration from character speech and tags each character. Then click *Assembler le livre* (Assemble book).
